@@ -72,13 +72,13 @@ If you cannot identify it at all, still return valid JSON with title "UNKNOWN", 
     );
 
     if (!response.ok) {
-      const err = await response.json();
-      console.error("Gemini error:", err);
-      return NextResponse.json(
-        { error: "Gemini API error. Please try again." },
-        { status: 500 }
-      );
-    }
+  const err = await response.json();
+  console.error("Gemini error:", JSON.stringify(err));
+  return NextResponse.json(
+    { error: err?.error?.message || "Gemini API error. Please try again." },
+    { status: 500 }
+  );
+}
 
     const geminiData = await response.json();
     const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
