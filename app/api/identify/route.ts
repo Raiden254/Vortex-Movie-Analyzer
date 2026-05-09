@@ -89,9 +89,11 @@ If you cannot identify it at all, still return valid JSON with title "UNKNOWN", 
       .replace(/```/g, "")
       .trim();
 
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+
     let result;
     try {
-      result = JSON.parse(clean);
+      result = JSON.parse(jsonMatch ? jsonMatch[0] : clean);
     } catch {
       console.error("Failed to parse Gemini response:", rawText);
       return NextResponse.json(
