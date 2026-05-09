@@ -71,6 +71,21 @@ If you cannot identify it at all, still return valid JSON with title "UNKNOWN", 
       }
     );
 
+    if (response.status === 429) {
+  return NextResponse.json({
+    title: "QUOTA EXCEEDED",
+    year: "—",
+    director: "—",
+    genre: "—",
+    runtime: "—",
+    rating: "—",
+    description: "Vortex is getting a lot of love right now! Daily AI quota reached. Please try again in a few hours.",
+    scene: "—",
+    confidence: 0,
+    alternatives: [],
+    signals: { visual: 0, dialogue: 0, colorGrade: 0, textTitles: 0 },
+  });
+}
     if (!response.ok) {
   const err = await response.json();
   console.error("Gemini error:", JSON.stringify(err));
