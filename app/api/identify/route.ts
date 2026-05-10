@@ -12,7 +12,87 @@ const FALLBACK = {
   confidence: 0,
   alternatives: [],
   signals: { visual: 0, dialogue: 0, colorGrade: 0, textTitles: 0 },
+  tmdb: null,
 };
+
+// Fetch movie details from TMDB
+async function fetchTMDB(title: string, year: string) {
+  try {
+    const tmdbKey = process.env.TMDB_API_KEY;
+    if (!tmdbKey) return null;
+
+    // Search for the movie
+    const searchRes = await fetch(
+      `https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&year=${year}&language=en-US&page=1`
+    );
+    if (!searchRes.ok) return null;
+
+    const searchData = await searchRes.json();
+    const movie = searchData.results?.[0];
+    if (!movie) return null;
+
+    const movieId = movie.id;
+
+    // Fetch full details, credits, and videos in parallel
+    const [detailsRes, creditsRes, videosRes, providersRes] = await Promise.all([
+      fetch(`https://api.themoviedb.org/3/movie/${movieId}?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/movie/${movieId}/credits?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/movie/${movieId}/videos?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/movie/${movieId}/watch/providers?api_key=${tmdbKey}`),
+    ]);
+
+    const [details, credits, videos, providers] = await Promise.all([
+      detailsRes.json(),
+      creditsRes.json(),
+      videosRes.json(),
+      providersRes.json(),
+    ]);
+
+    // Get trailer
+    const trailer = videos.results?.find(
+      (v: { type: string; site: string; key: string }) =>
+        v.type === "Trailer" && v.site === "YouTube"
+    );
+
+    // Get top cast
+    const cast = credits.cast?.slice(0, 6).map((c: { name: string; character: string; profile_path: string }) => ({
+      name: c.name,
+      character: c.character,
+      photo: c.profile_path
+        ? `https://image.tmdb.org/t/p/w185${c.profile_path}`
+        : null,
+    }));
+
+    // Get streaming providers (US)
+    const streaming = providers.results?.US?.flatrate?.slice(0, 4).map(
+      (p: { provider_name: string; logo_path: string }) => ({
+        name: p.provider_name,
+        logo: `https://image.tmdb.org/t/p/w92${p.logo_path}`,
+      })
+    ) || [];
+
+    return {
+      id: movieId,
+      poster: details.poster_path
+        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
+        : null,
+      backdrop: details.backdrop_path
+        ? `https://image.tmdb.org/t/p/w1280${details.backdrop_path}`
+        : null,
+      tagline: details.tagline || "",
+      voteAverage: details.vote_average?.toFixed(1) || "—",
+      voteCount: details.vote_count || 0,
+      genres: details.genres?.map((g: { name: string }) => g.name) || [],
+      trailer: trailer ? `https://www.youtube.com/watch?v=${trailer.key}` : null,
+      cast: cast || [],
+      streaming,
+      tmdbUrl: `https://www.themoviedb.org/movie/${movieId}`,
+    };
+  } catch (err) {
+    console.error("TMDB fetch error:", err);
+    return null;
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -24,9 +104,7 @@ export async function POST(req: NextRequest) {
     }
 
     const apiKey = process.env.GEMINI_API_KEY;
-
     if (!apiKey) {
-      console.error("GEMINI_API_KEY is not set");
       return NextResponse.json({ error: "API key not configured." }, { status: 500 });
     }
 
@@ -50,15 +128,8 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
       contents: [
         {
           parts: [
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data: base64,
-              },
-            },
-            {
-              text: prompt,
-            },
+            { inline_data: { mime_type: mimeType, data: base64 } },
+            { text: prompt },
           ],
         },
       ],
@@ -78,9 +149,7 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
       }
     );
 
-    // Handle quota exceeded
     if (response.status === 429) {
-      console.error("Gemini quota exceeded");
       return NextResponse.json({
         ...FALLBACK,
         title: "QUOTA EXCEEDED",
@@ -98,53 +167,39 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
     }
 
     const geminiData = await response.json();
-    console.log("Gemini raw response:", JSON.stringify(geminiData));
+    const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-    // Extract text from response
-    const rawText =
-      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
-    if (!rawText) {
-      console.error("Empty response from Gemini");
-      return NextResponse.json(FALLBACK);
-    }
+    if (!rawText) return NextResponse.json(FALLBACK);
 
     // Try multiple parsing strategies
     let result = null;
-
-    // Strategy 1: Direct parse
     try {
       result = JSON.parse(rawText.trim());
     } catch {
-      // Strategy 2: Extract JSON object with regex
       try {
         const match = rawText.match(/\{[\s\S]*\}/);
-        if (match) {
-          result = JSON.parse(match[0]);
-        }
+        if (match) result = JSON.parse(match[0]);
       } catch {
-        // Strategy 3: Clean and try again
         try {
           const cleaned = rawText
             .replace(/```json\n?/g, "")
             .replace(/```\n?/g, "")
-            .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
             .trim();
           const match2 = cleaned.match(/\{[\s\S]*\}/);
-          if (match2) {
-            result = JSON.parse(match2[0]);
-          }
+          if (match2) result = JSON.parse(match2[0]);
         } catch {
-          console.error("All parsing strategies failed. Raw text:", rawText);
+          console.error("All parsing failed:", rawText);
         }
       }
     }
 
-    if (!result) {
-      return NextResponse.json(FALLBACK);
-    }
+    if (!result) return NextResponse.json(FALLBACK);
 
-    // Ensure all required fields exist
+    // Fetch TMDB data in parallel with building safe result
+    const tmdbData = result.title !== "UNKNOWN"
+      ? await fetchTMDB(result.title, result.year)
+      : null;
+
     const safeResult = {
       title: result.title || "UNKNOWN",
       year: result.year || "—",
@@ -162,6 +217,7 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
         colorGrade: result.signals?.colorGrade ?? 0,
         textTitles: result.signals?.textTitles ?? 0,
       },
+      tmdb: tmdbData,
     };
 
     return NextResponse.json(safeResult);
