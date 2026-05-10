@@ -125,20 +125,24 @@ Use exactly this structure:
 If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON.`;
 
     const requestBody = {
-      contents: [
-        {
-          parts: [
-            { inline_data: { mime_type: mimeType, data: base64 } },
-            { text: prompt },
-          ],
-        },
+  contents: [
+    {
+      parts: [
+        { inline_data: { mime_type: mimeType, data: base64 } },
+        { text: prompt },
       ],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 1024,
-        responseMimeType: "application/json",
-      },
-    };
+    },
+  ],
+  tools: [
+    {
+      googleSearch: {}
+    }
+  ],
+  generationConfig: {
+    temperature: 0.1,
+    maxOutputTokens: 1024,
+  },
+};
 
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
