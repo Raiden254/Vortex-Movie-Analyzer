@@ -168,6 +168,8 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
 
     const geminiData = await response.json();
     const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    console.log("RAW GEMINI TEXT:", rawText);
+    console.log("FULL RESPONSE:", JSON.stringify(geminiData?.candidates?.[0]));
 
     if (!rawText) return NextResponse.json(FALLBACK);
 
