@@ -52,15 +52,42 @@ export default function IdentifyPage() {
   ];
   const [stageText, setStageText] = useState(stages[0]);
 
-  function handleFile(f: File) {
-    setFile(f);
+  async function compressImage(f: File): Promise<File> {
+    return new Promise((resolve) => {
+      const img = document.createElement("img");
+      const url = URL.createObjectURL(f);
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const MAX = 1280;
+        let { width, height } = img;
+        if (width > MAX) { height = (height * MAX) / width; width = MAX; }
+        if (height > MAX) { width = (width * MAX) / height; height = MAX; }
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d")?.drawImage(img, 0, 0, width, height);
+        canvas.toBlob((blob) => {
+          if (blob) resolve(new File([blob], f.name, { type: "image/jpeg" }));
+          else resolve(f);
+        }, "image/jpeg", 0.85);
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+    });
+  }
+
+  async function handleFile(f: File) {
     setResult(null);
     setStatus("idle");
     setErrorMsg("");
-    if (tab === "image") {
-      setPreview(URL.createObjectURL(f));
+    // Compress image if too large
+    if (f.type.startsWith("image/") && f.size > 2 * 1024 * 1024) {
+      const compressed = await compressImage(f);
+      setFile(compressed);
+      setPreview(URL.createObjectURL(compressed));
     } else {
-      setPreview(null);
+      setFile(f);
+      if (tab === "image") setPreview(URL.createObjectURL(f));
+      else setPreview(null);
     }
   }
 

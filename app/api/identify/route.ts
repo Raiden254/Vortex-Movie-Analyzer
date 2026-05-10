@@ -99,6 +99,14 @@ export async function POST(req: NextRequest) {
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
 
+    // Check file size - max 4MB
+if (file && file.size > 4 * 1024 * 1024) {
+  return NextResponse.json(
+    { error: "File too large. Please use an image under 4MB." },
+    { status: 413 }
+  );
+}
+
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
