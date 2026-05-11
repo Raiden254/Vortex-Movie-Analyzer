@@ -15,13 +15,11 @@ const FALLBACK = {
   tmdb: null,
 };
 
-// Fetch movie OR TV show details from TMDB
-async function fetchTMDB(title: string, year: string) {
+async function fetchTMDB(title: string, year: string, knownMediaType?: string) {
   try {
     const tmdbKey = process.env.TMDB_API_KEY;
     if (!tmdbKey) return null;
 
-    // Search both movies AND TV shows simultaneously
     const [movieRes, tvRes] = await Promise.all([
       fetch(`https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&language=en-US&page=1`),
       fetch(`https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&language=en-US&page=1`),
@@ -35,45 +33,50 @@ async function fetchTMDB(title: string, year: string) {
     const movies = movieData.results || [];
     const shows = tvData.results || [];
 
-    // Pick best match by comparing release year first
     let best = null;
     let isTV = false;
 
-    for (const m of movies) {
-      const my = m.release_date?.slice(0, 4);
-      if (my === year) { best = m; isTV = false; break; }
-    }
-
-    if (!best) {
-      for (const s of shows) {
-        const sy = s.first_air_date?.slice(0, 4);
-        if (sy === year) { best = s; isTV = true; break; }
+    if (knownMediaType === "tv") {
+      isTV = true;
+      best = shows.find((s: { first_air_date?: string }) =>
+        s.first_air_date?.slice(0, 4) === year
+      ) || shows[0] || null;
+    } else if (knownMediaType === "movie") {
+      isTV = false;
+      best = movies.find((m: { release_date?: string }) =>
+        m.release_date?.slice(0, 4) === year
+      ) || movies[0] || null;
+    } else {
+      for (const m of movies) {
+        if (m.release_date?.slice(0, 4) === year) { best = m; isTV = false; break; }
       }
-    }
-
-    // Fallback — take highest popularity result across both
-    if (!best) {
-      const allResults = [
-  ...movies.map((m: { popularity: number }) => ({ ...m, _isTV: false })),
-  ...shows.map((s: { popularity: number }) => ({ ...s, _isTV: true })),
-].sort((a, b) => b.popularity - a.popularity);
-      if (allResults.length > 0) {
-        best = allResults[0];
-        isTV = allResults[0]._isTV;
+      if (!best) {
+        for (const s of shows) {
+          if (s.first_air_date?.slice(0, 4) === year) { best = s; isTV = true; break; }
+        }
+      }
+      if (!best) {
+        const allResults = [
+          ...movies.map((m: { popularity: number }) => ({ ...m, _isTV: false })),
+          ...shows.map((s: { popularity: number }) => ({ ...s, _isTV: true })),
+        ].sort((a, b) => b.popularity - a.popularity);
+        if (allResults.length > 0) {
+          best = allResults[0];
+          isTV = allResults[0]._isTV;
+        }
       }
     }
 
     if (!best) return null;
 
-    const mediaType = isTV ? "tv" : "movie";
+    const tmdbType = isTV ? "tv" : "movie";
     const id = best.id;
 
-    // Fetch full details, credits, videos, providers in parallel
     const [detailsRes, creditsRes, videosRes, providersRes] = await Promise.all([
-      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/credits?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/videos?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/watch/providers?api_key=${tmdbKey}`),
+      fetch(`https://api.themoviedb.org/3/${tmdbType}/${id}?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${tmdbType}/${id}/credits?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${tmdbType}/${id}/videos?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${tmdbType}/${id}/watch/providers?api_key=${tmdbKey}`),
     ]);
 
     const [details, credits, videos, providers] = await Promise.all([
@@ -83,20 +86,17 @@ async function fetchTMDB(title: string, year: string) {
       providersRes.json(),
     ]);
 
-    // Get trailer
     const trailer = videos.results?.find(
       (v: { type: string; site: string; key: string }) =>
         v.type === "Trailer" && v.site === "YouTube"
     );
 
-    // Get top cast
     const cast = credits.cast?.slice(0, 6).map((c: { name: string; character: string; profile_path: string }) => ({
       name: c.name,
       character: c.character,
       photo: c.profile_path ? `https://image.tmdb.org/t/p/w185${c.profile_path}` : null,
     }));
 
-    // Get streaming providers (US)
     const streaming = providers.results?.US?.flatrate?.slice(0, 4).map(
       (p: { provider_name: string; logo_path: string }) => ({
         name: p.provider_name,
@@ -115,7 +115,7 @@ async function fetchTMDB(title: string, year: string) {
       trailer: trailer ? `https://www.youtube.com/watch?v=${trailer.key}` : null,
       cast: cast || [],
       streaming,
-      tmdbUrl: `https://www.themoviedb.org/${mediaType}/${id}`,
+      tmdbUrl: `https://www.themoviedb.org/${tmdbType}/${id}`,
     };
   } catch (err) {
     console.error("TMDB fetch error:", err);
@@ -128,7 +128,6 @@ export async function POST(req: NextRequest) {
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
 
-    // Check file size - max 4MB
     if (file && file.size > 4 * 1024 * 1024) {
       return NextResponse.json(
         { error: "File too large. Please use an image under 4MB." },
@@ -145,7 +144,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "API key not configured." }, { status: 500 });
     }
 
-    // Convert file to base64
     const bytes = await file.arrayBuffer();
     const base64 = Buffer.from(bytes).toString("base64");
     const mimeType = file.type || "image/jpeg";
@@ -157,8 +155,9 @@ Analyze this image and identify what movie or TV show it is from.
 You MUST respond with ONLY a JSON object. No explanation, no markdown, no backticks. Just the raw JSON.
 
 Use exactly this structure:
-{"title":"MOVIE TITLE IN CAPS","year":"2014","director":"Director Name","genre":"Genre","runtime":"120 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie this is from","confidence":85,"alternatives":[{"title":"Other Movie","year":"2010","confidence":45},{"title":"Another Movie","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
+{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2019","director":"Director Name","genre":"Genre","runtime":"60 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","confidence":85,"alternatives":[{"title":"Other Movie","year":"2010","confidence":45},{"title":"Another Movie","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
 
+IMPORTANT: Set "mediaType" to "tv" for TV shows and series, or "movie" for films.
 If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON.`;
 
     const requestBody = {
@@ -209,7 +208,6 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
 
     if (!rawText) return NextResponse.json(FALLBACK);
 
-    // Try multiple parsing strategies
     let result = null;
     try {
       result = JSON.parse(rawText.trim());
@@ -233,9 +231,8 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
 
     if (!result) return NextResponse.json(FALLBACK);
 
-    // Fetch TMDB data
     const tmdbData = result.title !== "UNKNOWN"
-      ? await fetchTMDB(result.title, result.year)
+      ? await fetchTMDB(result.title, result.year, result.mediaType)
       : null;
 
     const safeResult = {
