@@ -15,30 +15,65 @@ const FALLBACK = {
   tmdb: null,
 };
 
-// Fetch movie details from TMDB
+// Fetch movie OR TV show details from TMDB
 async function fetchTMDB(title: string, year: string) {
   try {
     const tmdbKey = process.env.TMDB_API_KEY;
     if (!tmdbKey) return null;
 
-    // Search for the movie
-    const searchRes = await fetch(
-      `https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&year=${year}&language=en-US&page=1`
-    );
-    if (!searchRes.ok) return null;
+    // Search both movies AND TV shows simultaneously
+    const [movieRes, tvRes] = await Promise.all([
+      fetch(`https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&language=en-US&page=1`),
+      fetch(`https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(title)}&language=en-US&page=1`),
+    ]);
 
-    const searchData = await searchRes.json();
-    const movie = searchData.results?.[0];
-    if (!movie) return null;
+    const [movieData, tvData] = await Promise.all([
+      movieRes.json(),
+      tvRes.json(),
+    ]);
 
-    const movieId = movie.id;
+    const movies = movieData.results || [];
+    const shows = tvData.results || [];
 
-    // Fetch full details, credits, and videos in parallel
+    // Pick best match by comparing release year first
+    let best = null;
+    let isTV = false;
+
+    for (const m of movies) {
+      const my = m.release_date?.slice(0, 4);
+      if (my === year) { best = m; isTV = false; break; }
+    }
+
+    if (!best) {
+      for (const s of shows) {
+        const sy = s.first_air_date?.slice(0, 4);
+        if (sy === year) { best = s; isTV = true; break; }
+      }
+    }
+
+    // Fallback — take highest popularity result across both
+    if (!best) {
+      const allResults = [
+  ...movies.map((m: { popularity: number }) => ({ ...m, _isTV: false })),
+  ...shows.map((s: { popularity: number }) => ({ ...s, _isTV: true })),
+].sort((a, b) => b.popularity - a.popularity);
+      if (allResults.length > 0) {
+        best = allResults[0];
+        isTV = allResults[0]._isTV;
+      }
+    }
+
+    if (!best) return null;
+
+    const mediaType = isTV ? "tv" : "movie";
+    const id = best.id;
+
+    // Fetch full details, credits, videos, providers in parallel
     const [detailsRes, creditsRes, videosRes, providersRes] = await Promise.all([
-      fetch(`https://api.themoviedb.org/3/movie/${movieId}?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/movie/${movieId}/credits?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/movie/${movieId}/videos?api_key=${tmdbKey}&language=en-US`),
-      fetch(`https://api.themoviedb.org/3/movie/${movieId}/watch/providers?api_key=${tmdbKey}`),
+      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/credits?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/videos?api_key=${tmdbKey}&language=en-US`),
+      fetch(`https://api.themoviedb.org/3/${mediaType}/${id}/watch/providers?api_key=${tmdbKey}`),
     ]);
 
     const [details, credits, videos, providers] = await Promise.all([
@@ -58,9 +93,7 @@ async function fetchTMDB(title: string, year: string) {
     const cast = credits.cast?.slice(0, 6).map((c: { name: string; character: string; profile_path: string }) => ({
       name: c.name,
       character: c.character,
-      photo: c.profile_path
-        ? `https://image.tmdb.org/t/p/w185${c.profile_path}`
-        : null,
+      photo: c.profile_path ? `https://image.tmdb.org/t/p/w185${c.profile_path}` : null,
     }));
 
     // Get streaming providers (US)
@@ -72,13 +105,9 @@ async function fetchTMDB(title: string, year: string) {
     ) || [];
 
     return {
-      id: movieId,
-      poster: details.poster_path
-        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
-        : null,
-      backdrop: details.backdrop_path
-        ? `https://image.tmdb.org/t/p/w1280${details.backdrop_path}`
-        : null,
+      id,
+      poster: details.poster_path ? `https://image.tmdb.org/t/p/w500${details.poster_path}` : null,
+      backdrop: details.backdrop_path ? `https://image.tmdb.org/t/p/w1280${details.backdrop_path}` : null,
       tagline: details.tagline || "",
       voteAverage: details.vote_average?.toFixed(1) || "—",
       voteCount: details.vote_count || 0,
@@ -86,7 +115,7 @@ async function fetchTMDB(title: string, year: string) {
       trailer: trailer ? `https://www.youtube.com/watch?v=${trailer.key}` : null,
       cast: cast || [],
       streaming,
-      tmdbUrl: `https://www.themoviedb.org/movie/${movieId}`,
+      tmdbUrl: `https://www.themoviedb.org/${mediaType}/${id}`,
     };
   } catch (err) {
     console.error("TMDB fetch error:", err);
@@ -100,12 +129,12 @@ export async function POST(req: NextRequest) {
     const file = formData.get("file") as File | null;
 
     // Check file size - max 4MB
-if (file && file.size > 4 * 1024 * 1024) {
-  return NextResponse.json(
-    { error: "File too large. Please use an image under 4MB." },
-    { status: 413 }
-  );
-}
+    if (file && file.size > 4 * 1024 * 1024) {
+      return NextResponse.json(
+        { error: "File too large. Please use an image under 4MB." },
+        { status: 413 }
+      );
+    }
 
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
@@ -177,7 +206,6 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
     const geminiData = await response.json();
     const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
     console.log("RAW GEMINI TEXT:", rawText);
-    console.log("FULL RESPONSE:", JSON.stringify(geminiData?.candidates?.[0]));
 
     if (!rawText) return NextResponse.json(FALLBACK);
 
@@ -205,7 +233,7 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
 
     if (!result) return NextResponse.json(FALLBACK);
 
-    // Fetch TMDB data in parallel with building safe result
+    // Fetch TMDB data
     const tmdbData = result.title !== "UNKNOWN"
       ? await fetchTMDB(result.title, result.year)
       : null;
