@@ -13,7 +13,10 @@ const FALLBACK = {
   alternatives: [],
   signals: { visual: 0, dialogue: 0, colorGrade: 0, textTitles: 0 },
   tmdb: null,
+  subtitleMatch: null,
 };
+
+// ─── TMDB ────────────────────────────────────────────────────────────────────
 
 async function fetchTMDB(title: string, year: string, knownMediaType?: string) {
   try {
@@ -123,6 +126,82 @@ async function fetchTMDB(title: string, year: string, knownMediaType?: string) {
   }
 }
 
+// ─── SUBTITLE MATCHING ───────────────────────────────────────────────────────
+
+interface SubtitleResult {
+  matched: boolean;
+  confidence: number;
+  matchSource: string;
+  confirmedTitle?: string;
+  confirmedYear?: string;
+  matchedLine?: string;
+}
+
+async function fetchSubtitleMatch(
+  title: string,
+  year: string,
+  mediaType: string,
+  dialogue?: string
+): Promise<SubtitleResult | null> {
+  try {
+    const apiKey = process.env.OPENSUBTITLES_API_KEY;
+    if (!apiKey) return null;
+
+    // Call our own subtitle route internally
+    const baseUrl = process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : "http://localhost:3000";
+
+    const res = await fetch(`${baseUrl}/api/subtitles`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, year, mediaType, dialogue }),
+    });
+
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error("Subtitle match fetch error:", err);
+    return null;
+  }
+}
+
+// ─── CONFIDENCE COMBINER ─────────────────────────────────────────────────────
+
+function combineConfidence(
+  geminiConfidence: number,
+  subtitleResult: SubtitleResult | null,
+  geminiTitle: string
+): { finalConfidence: number; boosted: boolean; overridden: boolean; overrideTitle?: string } {
+  if (!subtitleResult || !subtitleResult.matched) {
+    return { finalConfidence: geminiConfidence, boosted: false, overridden: false };
+  }
+
+  const subTitle = subtitleResult.confirmedTitle?.toLowerCase().trim() || "";
+  const gemTitle = geminiTitle.toLowerCase().trim();
+  const titlesAgree = subTitle === gemTitle || subTitle.includes(gemTitle) || gemTitle.includes(subTitle);
+
+  if (titlesAgree) {
+    // Both signals agree — boost confidence
+    const boost = subtitleResult.matchSource === "both" ? 10 : 7;
+    const boosted = Math.min(100, geminiConfidence + boost);
+    return { finalConfidence: boosted, boosted: true, overridden: false };
+  } else if (subtitleResult.confidence > geminiConfidence + 15) {
+    // Subtitle is much more confident and disagrees — override
+    return {
+      finalConfidence: subtitleResult.confidence,
+      boosted: false,
+      overridden: true,
+      overrideTitle: subtitleResult.confirmedTitle,
+    };
+  }
+
+  // Minor disagreement — keep Gemini but don't boost
+  return { finalConfidence: geminiConfidence, boosted: false, overridden: false };
+}
+
+// ─── MAIN HANDLER ────────────────────────────────────────────────────────────
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -155,10 +234,12 @@ Analyze this image and identify what movie or TV show it is from.
 You MUST respond with ONLY a JSON object. No explanation, no markdown, no backticks. Just the raw JSON.
 
 Use exactly this structure:
-{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2019","director":"Director Name","genre":"Genre","runtime":"60 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","confidence":85,"alternatives":[{"title":"Other Movie","year":"2010","confidence":45},{"title":"Another Movie","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
+{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2019","director":"Director Name","genre":"Genre","runtime":"60 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","dialogue":"Any visible or recognizable dialogue from this scene if present","confidence":85,"alternatives":[{"title":"Other Movie","year":"2010","confidence":45},{"title":"Another Movie","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
 
-IMPORTANT: Set "mediaType" to "tv" for TV shows and series, or "movie" for films.
-If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON.`;
+IMPORTANT:
+- Set "mediaType" to "tv" for TV shows and series, or "movie" for films.
+- If you can see or recognize any dialogue or spoken lines in this scene, include them in the "dialogue" field.
+- If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON.`;
 
     const requestBody = {
       contents: [
@@ -231,12 +312,42 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
 
     if (!result) return NextResponse.json(FALLBACK);
 
-    const tmdbData = result.title !== "UNKNOWN"
-      ? await fetchTMDB(result.title, result.year, result.mediaType)
-      : null;
+    // Run TMDB and subtitle matching in parallel
+    const [tmdbData, subtitleResult] = await Promise.all([
+      result.title !== "UNKNOWN"
+        ? fetchTMDB(result.title, result.year, result.mediaType)
+        : Promise.resolve(null),
+      result.title !== "UNKNOWN"
+        ? fetchSubtitleMatch(
+            result.title,
+            result.year,
+            result.mediaType || "movie",
+            result.dialogue
+          )
+        : Promise.resolve(null),
+    ]);
+
+    // Combine Gemini + subtitle confidence
+    const { finalConfidence, boosted, overridden, overrideTitle } = combineConfidence(
+      result.confidence ?? 0,
+      subtitleResult,
+      result.title
+    );
+
+    // If subtitle overrides Gemini's title, re-fetch TMDB with the correct title
+    let finalTmdb = tmdbData;
+    let finalTitle = result.title;
+    if (overridden && overrideTitle) {
+      finalTitle = overrideTitle.toUpperCase();
+      finalTmdb = await fetchTMDB(
+        overrideTitle,
+        subtitleResult?.confirmedYear || result.year,
+        result.mediaType
+      );
+    }
 
     const safeResult = {
-      title: result.title || "UNKNOWN",
+      title: finalTitle || "UNKNOWN",
       year: result.year || "—",
       director: result.director || "—",
       genre: result.genre || "—",
@@ -244,7 +355,7 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
       rating: result.rating || "—",
       description: result.description || "No description available.",
       scene: result.scene || "—",
-      confidence: result.confidence ?? 0,
+      confidence: finalConfidence,
       alternatives: Array.isArray(result.alternatives) ? result.alternatives : [],
       signals: {
         visual: result.signals?.visual ?? 0,
@@ -252,7 +363,16 @@ If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still 
         colorGrade: result.signals?.colorGrade ?? 0,
         textTitles: result.signals?.textTitles ?? 0,
       },
-      tmdb: tmdbData,
+      tmdb: finalTmdb,
+      subtitleMatch: subtitleResult
+        ? {
+            matched: subtitleResult.matched,
+            matchSource: subtitleResult.matchSource,
+            matchedLine: subtitleResult.matchedLine || null,
+            boosted,
+            overridden,
+          }
+        : null,
     };
 
     return NextResponse.json(safeResult);
