@@ -227,18 +227,31 @@ export async function POST(req: NextRequest) {
     const base64 = Buffer.from(bytes).toString("base64");
     const mimeType = file.type || "image/jpeg";
 
-    const prompt = `You are a movie and TV show identification expert.
+    const prompt = `You are an expert identifier of movies, TV shows, and animated content including anime, cartoons, and animated films.
 
-Analyze this image and identify what movie or TV show it is from.
+Analyze this image carefully and identify what movie, TV show, or animated series it is from.
+
+Pay close attention to:
+- Character designs, art style, and animation quality
+- Color palette and visual aesthetic
+- Any visible text, logos, or title cards
+- Scene composition and setting
+- Distinctive character features (hair, costume, powers, weapons)
+- Background art style (anime vs western animation vs CGI)
+
+For animated content specifically:
+- Anime shows have distinct Japanese animation styles
+- Western cartoons have different proportions and color usage
+- Note whether it is 2D traditional, 2D digital, or 3D CGI animation
 
 You MUST respond with ONLY a JSON object. No explanation, no markdown, no backticks. Just the raw JSON.
 
 Use exactly this structure:
-{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2019","director":"Director Name","genre":"Genre","runtime":"60 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","dialogue":"Any visible or recognizable dialogue from this scene if present","confidence":85,"alternatives":[{"title":"Other Movie","year":"2010","confidence":45},{"title":"Another Movie","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
+{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2021","director":"Director Name","genre":"Animation / Superhero","runtime":"45 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","confidence":85,"alternatives":[{"title":"Other Show","year":"2010","confidence":45},{"title":"Another Show","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
 
-IMPORTANT:
-- Set "mediaType" to "tv" for TV shows and series, or "movie" for films.
-- If you can see or recognize any dialogue or spoken lines in this scene, include them in the "dialogue" field.
+IMPORTANT: 
+- Set "mediaType" to "tv" for TV shows and series, or "movie" for films
+- For animated shows be very precise — Invincible, Avatar The Last Airbender, Attack on Titan, One Piece etc all have very distinct styles
 - If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON.`;
 
     const requestBody = {
