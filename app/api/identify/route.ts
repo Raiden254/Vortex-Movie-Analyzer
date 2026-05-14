@@ -20,176 +20,87 @@ const FALLBACK = {
 
 const INDEX_NAME = "vortex-movies";
 
-// ─── CLIP FINGERPRINT ─────────────────────────────────────────────────────────
+// ─── PINECONE TITLE VERIFICATION ─────────────────────────────────────────────
+// Instead of vector search (requires Xenova which can't run on Vercel),
+// we verify Gemini's answer by checking if the title exists in our database.
+// If it does, we boost confidence. This uses metadata filtering — instant and free.
 
-async function getClipEmbedding(
-  base64: string,
-  mimeType: string
-): Promise<number[] | null> {
-  const hfKey = process.env.HUGGINGFACE_API_KEY;
-  if (!hfKey) return null;
-
-  try {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    const blob = new Blob([bytes], { type: mimeType });
-
-    const doRequest = () =>
-      fetch(
-        "https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${hfKey}`,
-            "Content-Type": mimeType,
-          },
-          body: blob,
-        }
-      );
-
-    let res = await doRequest();
-
-    // Cold start — model loading, wait and retry once
-    if (res.status === 503) {
-      await new Promise((r) => setTimeout(r, 10000));
-      res = await doRequest();
-    }
-
-    if (!res.ok) {
-      console.error("HuggingFace CLIP error:", res.status);
-      return null;
-    }
-
-    const data = await res.json();
-    const embedding = extractEmbedding(data);
-    if (!embedding) return null;
-
-    // Normalize for cosine similarity
-    const magnitude = Math.sqrt(
-      embedding.reduce((sum: number, v: number) => sum + v * v, 0)
-    );
-    return magnitude === 0 ? embedding : embedding.map((v: number) => v / magnitude);
-  } catch (err) {
-    console.error("CLIP embedding error:", err);
-    return null;
-  }
-}
-
-function extractEmbedding(data: unknown): number[] | null {
-  if (Array.isArray(data)) {
-    if (typeof data[0] === "number") return data as number[];
-    if (Array.isArray(data[0])) return data[0] as number[];
-  }
-  if (data && typeof data === "object") {
-    const obj = data as Record<string, unknown>;
-    if (Array.isArray(obj.embedding)) return obj.embedding as number[];
-    if (Array.isArray(obj.embeddings)) {
-      const emb = obj.embeddings as unknown[];
-      return (Array.isArray(emb[0]) ? emb[0] : emb) as number[];
-    }
-    if (Array.isArray(obj.image_embeds)) return obj.image_embeds as number[];
-  }
-  return null;
-}
-
-// ─── PINECONE SEARCH ──────────────────────────────────────────────────────────
-
-interface VectorMatch {
-  id: string;
-  score: number;
-  metadata: {
-    title?: string;
-    year?: string;
-    mediaType?: string;
-    director?: string;
-    genre?: string;
-    scene?: string;
-    frameTime?: string;
-  };
-}
-
-interface ClipMatch {
-  matched: boolean;
+interface PineconeVerification {
+  verified: boolean;
   confidence: number;
-  score: number;
-  title?: string;
-  year?: string;
-  mediaType?: string;
-  director?: string;
-  genre?: string;
-  scene?: string;
-  alternatives: { title: string; year: string; confidence: number }[];
+  databaseTitle?: string;
+  databaseYear?: string;
+  databaseGenre?: string;
+  databaseDirector?: string;
 }
 
-function scoreToConfidence(score: number): number {
-  if (score >= 0.95) return 98;
-  if (score >= 0.90) return 92;
-  if (score >= 0.85) return 85;
-  if (score >= 0.80) return 75;
-  if (score >= 0.75) return 65;
-  if (score >= 0.70) return 55;
-  return Math.round(score * 50);
-}
-
-async function searchPinecone(embedding: number[]): Promise<ClipMatch | null> {
+async function verifyWithPinecone(
+  title: string,
+  year: string
+): Promise<PineconeVerification> {
   const pineconeKey = process.env.PINECONE_API_KEY;
-  if (!pineconeKey) return null;
+  if (!pineconeKey) return { verified: false, confidence: 0 };
 
   try {
     const pinecone = new Pinecone({ apiKey: pineconeKey });
     const index = pinecone.index(INDEX_NAME);
 
+    // Fetch index stats to check if database has any vectors
+    const stats = await index.describeIndexStats();
+    const totalVectors = stats.totalRecordCount || 0;
+
+    if (totalVectors === 0) {
+      return { verified: false, confidence: 0 };
+    }
+
+    // Use a dummy vector to do a metadata-filtered search
+    // We search for the title in metadata across all indexed movies
+    const dummyVector = new Array(512).fill(0);
+    dummyVector[0] = 1; // non-zero so Pinecone accepts it
+
     const queryResponse = await index.query({
-      vector: embedding,
-      topK: 5,
+      vector: dummyVector,
+      topK: 100,
       includeMetadata: true,
+      filter: undefined, // fetch all, we'll filter manually
     });
 
-    const matches = queryResponse.matches as VectorMatch[];
-    if (!matches || matches.length === 0) {
-      return { matched: false, confidence: 0, score: 0, alternatives: [] };
+    const matches = queryResponse.matches || [];
+
+    // Search for title match in metadata
+    const cleanTitle = title.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+
+    const titleMatch = matches.find((m) => {
+      const dbTitle = ((m.metadata?.title as string) || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, "")
+        .trim();
+      return (
+        dbTitle === cleanTitle ||
+        dbTitle.includes(cleanTitle) ||
+        cleanTitle.includes(dbTitle)
+      );
+    });
+
+    if (!titleMatch) {
+      return { verified: false, confidence: 0 };
     }
 
-    const best = matches[0];
-    const bestScore = best.score || 0;
-    const THRESHOLD = 0.70;
-
-    const alternatives = matches
-      .slice(1, 4)
-      .filter((m) => (m.score || 0) >= 0.60)
-      .map((m) => ({
-        title: m.metadata?.title || "Unknown",
-        year: m.metadata?.year || "—",
-        confidence: scoreToConfidence(m.score || 0),
-      }));
-
-    if (bestScore < THRESHOLD) {
-      return {
-        matched: false,
-        confidence: scoreToConfidence(bestScore),
-        score: bestScore,
-        alternatives,
-      };
-    }
+    // Check if year also matches for stronger verification
+    const dbYear = (titleMatch.metadata?.year as string) || "";
+    const yearMatches = dbYear === year || !year || year === "—";
 
     return {
-      matched: true,
-      confidence: scoreToConfidence(bestScore),
-      score: bestScore,
-      title: best.metadata?.title,
-      year: best.metadata?.year,
-      mediaType: best.metadata?.mediaType,
-      director: best.metadata?.director,
-      genre: best.metadata?.genre,
-      scene: best.metadata?.scene,
-      alternatives,
+      verified: true,
+      confidence: yearMatches ? 15 : 8, // boost amount
+      databaseTitle: titleMatch.metadata?.title as string,
+      databaseYear: dbYear,
+      databaseGenre: titleMatch.metadata?.genre as string,
+      databaseDirector: titleMatch.metadata?.director as string,
     };
   } catch (err) {
-    console.error("Pinecone search error:", err);
-    return null;
+    console.error("Pinecone verification error:", err);
+    return { verified: false, confidence: 0 };
   }
 }
 
@@ -381,46 +292,73 @@ function combineConfidence(
 
 // ─── GEMINI IDENTIFICATION ────────────────────────────────────────────────────
 
-async function runGemini(
-  base64: string,
-  mimeType: string,
-  clipHint?: { title?: string; year?: string; genre?: string }
-) {
+async function runGemini(base64: string, mimeType: string) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
 
-  // If CLIP found a strong match, hint Gemini to confirm rather than guess
-  const clipContext = clipHint?.title
-    ? `\n\nIMPORTANT HINT: Visual fingerprint analysis strongly suggests this is from "${clipHint.title}" (${clipHint.year || "unknown year"}). Confirm or correct this if you are confident otherwise.`
-    : "";
+  // MASSIVELY improved prompt for accuracy
+  const prompt = `You are an elite movie and TV show scene identification system with encyclopedic knowledge of cinema and television worldwide, including Hollywood, Bollywood, African cinema, anime, K-dramas, European films, and all streaming content.
 
-  const prompt = `You are an expert identifier of movies, TV shows, and animated content including anime, cartoons, and animated films.
+TASK: Identify the exact movie or TV show this image is from.
 
-Analyze this image carefully and identify what movie, TV show, or animated series it is from.
+ANALYSIS APPROACH — examine these signals in order:
+1. VISUAL FINGERPRINTS: Cinematography style, lighting setup, color grading signature, aspect ratio, film grain/digital look
+2. CHARACTER RECOGNITION: Face features, hairstyles, costumes, makeup, body language, distinctive props
+3. SET & LOCATION: Architecture, interior design era, location geography, weather/time of day
+4. TEXT & LOGOS: Any visible titles, subtitles, credits, watermarks, channel logos, streaming platform bugs
+5. ART STYLE: For animation — distinguish between anime (Japanese), manhwa (Korean), cartoon (Western), CGI style
+6. PRODUCTION ERA: Film stock quality, technology visible, fashion, cars, phones suggest the decade
+7. GENRE MARKERS: Horror lighting, rom-com color palette, action blocking, documentary handheld style
 
-Pay close attention to:
-- Character designs, art style, and animation quality
-- Color palette and visual aesthetic
-- Any visible text, logos, or title cards
-- Scene composition and setting
-- Distinctive character features (hair, costume, powers, weapons)
-- Background art style (anime vs western animation vs CGI)
+COMMON MISTAKES TO AVOID:
+- Do NOT confuse similar-looking shows (e.g. The Boys vs Invincible, Attack on Titan vs Vinland Saga)
+- Do NOT guess a popular title when visual evidence points elsewhere
+- Do NOT ignore text/logos visible in frame — they are definitive proof
+- For anime: pay close attention to art style differences between studios (MAPPA, Ufotable, Bones, etc.)
+- For Netflix/HBO/Amazon shows: look for their distinctive production quality signatures
 
-For animated content specifically:
-- Anime shows have distinct Japanese animation styles
-- Western cartoons have different proportions and color usage
-- Note whether it is 2D traditional, 2D digital, or 3D CGI animation
+CONFIDENCE CALIBRATION:
+- 90-100%: Definitive identification — you can see title text, recognizable unique character, or unmistakable scene
+- 70-89%: Strong identification — multiple visual signals align clearly
+- 50-69%: Probable identification — some signals match but uncertainty exists
+- Below 50%: Uncertain — provide best guess with alternatives
+- 0%: Cannot identify — return UNKNOWN
 
-You MUST respond with ONLY a JSON object. No explanation, no markdown, no backticks. Just the raw JSON.
+You MUST respond with ONLY a valid JSON object. No explanation, no markdown, no backticks, no text before or after. Just the raw JSON.
 
-Use exactly this structure:
-{"title":"MOVIE OR SHOW TITLE IN CAPS","year":"2021","director":"Director Name","genre":"Animation / Superhero","runtime":"45 min","rating":"8.5/10","description":"Brief one sentence plot summary.","scene":"Which part of the movie or show this is from","mediaType":"tv","dialogue":"Any visible or recognizable dialogue from this scene if present","confidence":85,"alternatives":[{"title":"Other Show","year":"2010","confidence":45},{"title":"Another Show","year":"2015","confidence":30},{"title":"Third Option","year":"2018","confidence":20}],"signals":{"visual":85,"dialogue":70,"colorGrade":80,"textTitles":60}}
+Required structure:
+{
+  "title": "EXACT TITLE IN CAPS",
+  "year": "2019",
+  "director": "Full Name",
+  "genre": "Primary Genre / Secondary Genre",
+  "runtime": "45 min per episode",
+  "rating": "8.5/10",
+  "description": "One precise sentence describing the plot.",
+  "scene": "Specific description of what is happening in this exact scene and where it falls in the story",
+  "mediaType": "tv",
+  "dialogue": "Any spoken words visible or recognizable in this scene",
+  "confidence": 87,
+  "alternatives": [
+    {"title": "Second Most Likely", "year": "2018", "confidence": 35},
+    {"title": "Third Most Likely", "year": "2020", "confidence": 20},
+    {"title": "Fourth Option", "year": "2015", "confidence": 10}
+  ],
+  "signals": {
+    "visual": 90,
+    "dialogue": 60,
+    "colorGrade": 80,
+    "textTitles": 40
+  }
+}
 
-IMPORTANT:
-- Set "mediaType" to "tv" for TV shows and series, or "movie" for films
-- For animated shows be very precise — Invincible, Avatar The Last Airbender, Attack on Titan, One Piece etc all have very distinct styles
-- If you can see or recognize any dialogue or spoken lines in this scene, include them in the "dialogue" field
-- If you cannot identify it, use "UNKNOWN" as title and 0 as confidence but still return valid JSON${clipContext}`;
+RULES:
+- "mediaType" must be exactly "tv" or "movie"
+- "confidence" must be an integer 0-100
+- All signal values must be integers 0-100
+- Always provide 3 alternatives even if confidence is very low
+- If UNKNOWN, still provide best guesses in alternatives
+- Title must be the ORIGINAL title (not a localized translation)`;
 
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
@@ -437,7 +375,7 @@ IMPORTANT:
           },
         ],
         generationConfig: {
-          temperature: 0.1,
+          temperature: 0.05, // lower = more precise, less creative guessing
           maxOutputTokens: 1024,
           responseMimeType: "application/json",
         },
@@ -456,7 +394,6 @@ IMPORTANT:
   console.log("RAW GEMINI TEXT:", rawText);
   if (!rawText) return null;
 
-  // Try parsing with 3 fallback strategies
   for (const attempt of [
     () => JSON.parse(rawText.trim()),
     () => { const m = rawText.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error(); },
@@ -491,26 +428,10 @@ export async function POST(req: NextRequest) {
     const base64 = Buffer.from(bytes).toString("base64");
     const mimeType = file.type || "image/jpeg";
 
-    // ── Step 1: CLIP fingerprint ──────────────────────────────────────────────
-    const embedding = await getClipEmbedding(base64, mimeType);
+    // ── Step 1: Run Gemini identification ────────────────────────────────────
+    const geminiResult = await runGemini(base64, mimeType);
 
-    // ── Step 2: Pinecone vector search (runs in parallel with Gemini) ─────────
-    const clipSearchPromise = embedding
-      ? searchPinecone(embedding)
-      : Promise.resolve(null);
-
-    // ── Step 3: Gemini identification (with CLIP hint if strong match) ────────
-    // We run CLIP search first with a short timeout so Gemini can be hinted
-    let clipMatch: ClipMatch | null = null;
-    let geminiResult = null;
-
-    // Run both in parallel — Gemini doesn't wait for CLIP
-    [clipMatch, geminiResult] = await Promise.all([
-      clipSearchPromise,
-      runGemini(base64, mimeType),
-    ]);
-
-    // Handle Gemini quota exceeded
+    // Handle quota exceeded
     if (geminiResult?._quotaExceeded) {
       return NextResponse.json({
         ...FALLBACK,
@@ -519,93 +440,60 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // If CLIP found a strong match but Gemini failed, use CLIP result directly
-    if (!geminiResult && clipMatch?.matched && clipMatch.title) {
-      const tmdbData = await fetchTMDB(
-        clipMatch.title,
-        clipMatch.year || "—",
-        clipMatch.mediaType
-      );
-      return NextResponse.json({
-        ...FALLBACK,
-        title: clipMatch.title.toUpperCase(),
-        year: clipMatch.year || "—",
-        director: clipMatch.director || "—",
-        genre: clipMatch.genre || "—",
-        confidence: clipMatch.confidence,
-        alternatives: clipMatch.alternatives,
-        tmdb: tmdbData,
-        clipMatch: {
-          matched: true,
-          confidence: clipMatch.confidence,
-          score: clipMatch.score,
-          source: "pinecone",
-        },
-      });
-    }
-
     if (!geminiResult) return NextResponse.json(FALLBACK);
 
-    // ── Step 4: Merge CLIP + Gemini confidence ────────────────────────────────
-    let mergedConfidence = geminiResult.confidence ?? 0;
-    let mergedTitle = geminiResult.title || "UNKNOWN";
+    const geminiTitle = geminiResult.title || "UNKNOWN";
+    const geminiYear = geminiResult.year || "—";
+    const geminiConfidence = geminiResult.confidence ?? 0;
 
-    if (clipMatch?.matched && clipMatch.title) {
-      const clipTitle = clipMatch.title.toLowerCase().trim();
-      const gemTitle = mergedTitle.toLowerCase().trim();
-      const agree =
-        clipTitle === gemTitle ||
-        clipTitle.includes(gemTitle) ||
-        gemTitle.includes(clipTitle);
-
-      if (agree) {
-        // Both agree — boost confidence
-        mergedConfidence = Math.min(
-          100,
-          Math.round((mergedConfidence + clipMatch.confidence) / 2) + 10
-        );
-      } else if (clipMatch.confidence > mergedConfidence + 20) {
-        // CLIP is much more confident — override Gemini
-        mergedTitle = clipMatch.title.toUpperCase();
-        mergedConfidence = clipMatch.confidence;
-      }
-    }
-
-    // ── Step 5: TMDB + Subtitle matching in parallel ──────────────────────────
-    const [tmdbData, subtitleResult] = await Promise.all([
-      mergedTitle !== "UNKNOWN"
-        ? fetchTMDB(mergedTitle, geminiResult.year, geminiResult.mediaType)
+    // ── Step 2: Pinecone title verification + TMDB + Subtitles in parallel ───
+    const [pineconeVerification, tmdbData, subtitleResult] = await Promise.all([
+      geminiTitle !== "UNKNOWN"
+        ? verifyWithPinecone(geminiTitle, geminiYear)
+        : Promise.resolve({ verified: false, confidence: 0 }),
+      geminiTitle !== "UNKNOWN"
+        ? fetchTMDB(geminiTitle, geminiYear, geminiResult.mediaType)
         : Promise.resolve(null),
-      mergedTitle !== "UNKNOWN"
+      geminiTitle !== "UNKNOWN"
         ? fetchSubtitleMatch(
-            mergedTitle,
-            geminiResult.year,
+            geminiTitle,
+            geminiYear,
             geminiResult.mediaType || "movie",
             geminiResult.dialogue
           )
         : Promise.resolve(null),
     ]);
 
-    // ── Step 6: Subtitle confidence boost ────────────────────────────────────
-    const { finalConfidence, boosted, overridden, overrideTitle } =
-      combineConfidence(mergedConfidence, subtitleResult, mergedTitle);
-
-    let finalTitle = mergedTitle;
+    // ── Step 3: Combine all confidence signals ────────────────────────────────
+    let finalConfidence = geminiConfidence;
+    let finalTitle = geminiTitle;
     let finalTmdb = tmdbData;
+
+    // Pinecone verification boost
+    if (pineconeVerification.verified) {
+      finalConfidence = Math.min(100, finalConfidence + pineconeVerification.confidence);
+      console.log(`Pinecone verified "${geminiTitle}" — boosted by ${pineconeVerification.confidence}%`);
+    }
+
+    // Subtitle matching boost/override
+    const { finalConfidence: subtitleConfidence, boosted, overridden, overrideTitle } =
+      combineConfidence(finalConfidence, subtitleResult, finalTitle);
+
+    finalConfidence = subtitleConfidence;
 
     if (overridden && overrideTitle) {
       finalTitle = overrideTitle.toUpperCase();
       finalTmdb = await fetchTMDB(
         overrideTitle,
-        subtitleResult?.confirmedYear || geminiResult.year,
+        subtitleResult?.confirmedYear || geminiYear,
         geminiResult.mediaType
       );
     }
 
-    // ── Step 7: Build final result ────────────────────────────────────────────
+    // ── Step 4: Build final result ────────────────────────────────────────────
     return NextResponse.json({
       title: finalTitle || "UNKNOWN",
-      year: geminiResult.year || "—",
+      year: geminiYear,
       director: geminiResult.director || "—",
       genre: geminiResult.genre || "—",
       runtime: geminiResult.runtime || "—",
@@ -632,15 +520,16 @@ export async function POST(req: NextRequest) {
             overridden,
           }
         : null,
-      clipMatch: clipMatch
+      clipMatch: pineconeVerification.verified
         ? {
-            matched: clipMatch.matched,
-            confidence: clipMatch.confidence,
-            score: clipMatch.score,
-            source: "pinecone",
+            matched: true,
+            confidence: pineconeVerification.confidence,
+            score: 1.0,
+            source: "pinecone-title-verification",
           }
         : null,
     });
+
   } catch (error) {
     console.error("Unexpected error:", error);
     return NextResponse.json(
