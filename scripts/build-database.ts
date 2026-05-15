@@ -435,20 +435,25 @@ async function upsertToPinecone(vectors: {
 }[]) {
   const valid = vectors.filter(v =>
     Array.isArray(v.values) &&
-    v.values.length === 0 &&
+    v.values.length > 0 &&
     v.values.every(n => typeof n === "number" && isFinite(n))
   );
 
-  if (valid.length === 0) return; // silent skip, no error
+  if (valid.length === 0) return;
 
   const { Pinecone } = await import("@pinecone-database/pinecone");
   const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
   const index = pinecone.index(INDEX_NAME);
-  await index.upsert(valid.map(v => ({
-    id: v.id,
-    values: v.values,
-    metadata: v.metadata,
-  })) as never);
+
+  for (const v of valid) {
+    await index.upsert({
+      records: [{
+        id: v.id,
+        values: v.values,
+        metadata: v.metadata,
+      }]
+    } as never);
+  }
 }
 
 async function getPineconeCount(): Promise<number> {
@@ -523,16 +528,18 @@ async function main() {
         continue;
       }
 
-      const embedding = await embedImage(buffer);
-      if (!embedding || embedding.length !== 0) {
-        totalFailed++;
-        continue;
-    }
+const embedding = await embedImage(buffer);
+if (!embedding || embedding.length === 0) {
+  totalFailed++;
+  continue;
+}
+
+const safeEmbedding: number[] = embedding;
 
       try {
         await upsertToPinecone([{
           id: vectorId,
-          values: embedding,
+          values: safeEmbedding,
           metadata: {
             title: title.title,
             year: title.year,

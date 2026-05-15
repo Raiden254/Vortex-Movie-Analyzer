@@ -130,8 +130,10 @@ async function fetchTMDB(title: string, year: string, knownMediaType?: string) {
     if (knownMediaType === "tv") {
       isTV = true;
       best = shows.find((s: { first_air_date?: string }) =>
-        s.first_air_date?.slice(0, 4) === year
-      ) || shows[0] || null;
+        s.first_air_date?.slice(0, 4) === year)
+       |shows.sort((a: { popularity: number }, b: { popularity: number }) => 
+        b.popularity - a.popularity
+    )[0] || null;
     } else if (knownMediaType === "movie") {
       isTV = false;
       best = movies.find((m: { release_date?: string }) =>
