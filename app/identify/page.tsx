@@ -347,15 +347,49 @@ export default function IdentifyPage() {
           </div>
         )}
 
-        {/* ERROR */}
-        {status === "error" && (
-          <div style={{ background: "var(--surface)", border: "1px solid rgba(224,92,92,0.3)", borderRadius: "16px", padding: "32px", textAlign: "center", animation: "fadeup 0.3s ease forwards" }}>
-            <div style={{ fontSize: "32px", marginBottom: "12px" }}>⚠️</div>
-            <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--text)", marginBottom: "8px" }}>Identification failed</div>
-            <div style={{ fontSize: "13px", color: "var(--muted)", marginBottom: "24px" }}>{errorMsg}</div>
-            <button onClick={reset} style={{ padding: "9px 20px", borderRadius: "8px", border: "none", background: "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>Try again</button>
+{/* ERROR / QUOTA */}
+{status === "error" && (
+  <div style={{
+    background: "var(--surface)",
+    border: `1px solid ${errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? "rgba(239,159,39,0.3)" : "rgba(224,92,92,0.3)"}`,
+    borderRadius: "16px",
+    padding: "40px 32px",
+    textAlign: "center"
+  }}>
+    {errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? (
+      <>
+        <div style={{ fontSize: "48px", marginBottom: "16px" }}>🔥</div>
+        <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", color: "#EF9F27", marginBottom: "8px" }}>Daily limit reached</div>
+        <div style={{ fontSize: "20px", fontWeight: 800, color: "var(--text)", marginBottom: "10px", letterSpacing: "-0.3px" }}>Vortex is in high demand!</div>
+        <div style={{ fontSize: "13px", color: "var(--muted)", lineHeight: 1.7, marginBottom: "24px", maxWidth: "340px", margin: "0 auto 24px" }}>
+          Our free AI quota has been used up for today. This resets every 24 hours at midnight Pacific time. Come back soon!
+        </div>
+        <div style={{ background: "rgba(239,159,39,0.08)", border: "1px solid rgba(239,159,39,0.2)", borderRadius: "10px", padding: "14px 20px", display: "inline-block", marginBottom: "24px" }}>
+          <div style={{ fontFamily: "DM Mono, monospace", fontSize: "11px", color: "#EF9F27", letterSpacing: "1px" }}>
+            ⏰ Resets in ~{new Date().getHours() < 8 ? `${8 - new Date().getHours()}h` : `${32 - new Date().getHours()}h`}
           </div>
-        )}
+        </div>
+        <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
+          <button onClick={reset} style={{ padding: "10px 20px", borderRadius: "8px", border: "none", background: "#EF9F27", color: "#1a0f00", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
+            Try again
+          </button>
+          <a href="/" style={{ padding: "10px 20px", borderRadius: "8px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", fontFamily: "Syne, sans-serif", textDecoration: "none", display: "inline-flex", alignItems: "center" }}>
+            ← Back to home
+          </a>
+        </div>
+      </>
+    ) : (
+      <>
+        <div style={{ fontSize: "32px", marginBottom: "12px" }}>⚠️</div>
+        <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--text)", marginBottom: "8px" }}>Identification failed</div>
+        <div style={{ fontSize: "13px", color: "var(--muted)", marginBottom: "24px" }}>{errorMsg}</div>
+        <button onClick={reset} style={{ padding: "9px 20px", borderRadius: "8px", border: "none", background: "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
+          Try again
+        </button>
+      </>
+    )}
+  </div>
+)}
 
         {/* RESULT */}
         {status === "done" && result && (
