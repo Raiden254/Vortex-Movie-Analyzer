@@ -399,11 +399,17 @@ async function getEmbedder() {
 
 async function embedImage(buffer: Buffer): Promise<number[] | null> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const model = await getEmbedder() as any;
     const image = await RawImage.fromBlob(new Blob([new Uint8Array(buffer)]));
     const output = await model(image, { pooling: "mean", normalize: true });
     const values = Array.from(output.data) as number[];
+
+    // Validate embedding
+    if (!values || values.length === 0) {
+      console.error("   Empty embedding returned");
+      return null;
+    }
+
     const mag = Math.sqrt(values.reduce((s, v) => s + v * v, 0));
     return mag === 0 ? values : values.map(v => v / mag);
   } catch (err) {
@@ -419,10 +425,18 @@ async function upsertToPinecone(vectors: {
   values: number[];
   metadata: Record<string, string>;
 }[]) {
+  const valid = vectors.filter(v =>
+    Array.isArray(v.values) &&
+    v.values.length === 512 &&
+    v.values.every(n => typeof n === "number" && isFinite(n))
+  );
+
+  if (valid.length === 0) return; // silent skip, no error
+
   const { Pinecone } = await import("@pinecone-database/pinecone");
   const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
   const index = pinecone.index(INDEX_NAME);
-  await index.upsert(vectors.map(v => ({
+  await index.upsert(valid.map(v => ({
     id: v.id,
     values: v.values,
     metadata: v.metadata,
@@ -502,10 +516,10 @@ async function main() {
       }
 
       const embedding = await embedImage(buffer);
-      if (!embedding) {
+      if (!embedding || embedding.length !== 512) {
         totalFailed++;
         continue;
-      }
+    }
 
       try {
         await upsertToPinecone([{
