@@ -399,21 +399,29 @@ async function getEmbedder() {
 
 async function embedImage(buffer: Buffer): Promise<number[] | null> {
   try {
-    const model = await getEmbedder() as any;
+    const model = await getEmbedder();
     const image = await RawImage.fromBlob(new Blob([new Uint8Array(buffer)]));
-    const output = await model(image, { pooling: "mean", normalize: true });
-    const values = Array.from(output.data) as number[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const output = await (model as any)(image, { pooling: "mean", normalize: true });
 
-    // Validate embedding
-    if (!values || values.length === 0) {
-      console.error("   Empty embedding returned");
-      return null;
+    // Handle different output formats from Xenova
+    let values: number[] = [];
+    if (output?.data) {
+      values = Array.from(output.data) as number[];
+    } else if (Array.isArray(output)) {
+      values = output as number[];
+    } else if (output?.last_hidden_state?.data) {
+      values = Array.from(output.last_hidden_state.data) as number[];
     }
+
+    console.log(`   Embedding dims: ${values.length}`);
+
+    if (values.length === 0) return null;
 
     const mag = Math.sqrt(values.reduce((s, v) => s + v * v, 0));
     return mag === 0 ? values : values.map(v => v / mag);
   } catch (err) {
-    console.error("Embed error:", err);
+    console.error("   Embed error:", err);
     return null;
   }
 }
@@ -427,7 +435,7 @@ async function upsertToPinecone(vectors: {
 }[]) {
   const valid = vectors.filter(v =>
     Array.isArray(v.values) &&
-    v.values.length === 512 &&
+    v.values.length === 0 &&
     v.values.every(n => typeof n === "number" && isFinite(n))
   );
 
@@ -516,7 +524,7 @@ async function main() {
       }
 
       const embedding = await embedImage(buffer);
-      if (!embedding || embedding.length !== 512) {
+      if (!embedding || embedding.length !== 0) {
         totalFailed++;
         continue;
     }

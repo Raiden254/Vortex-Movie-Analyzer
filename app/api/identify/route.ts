@@ -383,11 +383,41 @@ RULES:
     }
   );
 
-  if (response.status === 429) return { _quotaExceeded: true };
-  if (!response.ok) {
-    console.error("Gemini error:", response.status);
-    return null;
+// Retry once on 503
+if (response.status === 503) {
+  console.log("Gemini 503 — retrying in 5s...");
+  await new Promise(r => setTimeout(r, 5000));
+  const retry = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: prompt }] }],
+        generationConfig: { temperature: 0.05, maxOutputTokens: 2048, responseMimeType: "application/json" },
+      }),
+    }
+  );
+  if (!retry.ok) {
+    return { _serviceUnavailable: true };
   }
+  const retryData = await retry.json();
+  const retryText = retryData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  if (!retryText) return null;
+  for (const attempt of [
+    () => JSON.parse(retryText.trim()),
+    () => { const m = retryText.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error(); },
+  ]) {
+    try { return attempt(); } catch { continue; }
+  }
+  return null;
+}
+
+if (response.status === 429) return { _quotaExceeded: true };
+if (!response.ok) {
+  console.error("Gemini error:", response.status);
+  return null;
+}
 
   const geminiData = await response.json();
   const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
@@ -437,6 +467,14 @@ export async function POST(req: NextRequest) {
         ...FALLBACK,
         title: "QUOTA EXCEEDED",
         description: "Vortex is getting a lot of love right now! Daily AI limit reached. Please try again in a few hours.",
+      });
+    }
+    // Add this right after 
+    if (geminiResult?._serviceUnavailable) {
+      return NextResponse.json({
+        ...FALLBACK,
+        title: "SERVICE BUSY",
+        description: "Vortex AI is experiencing high demand right now. Please try again in a moment.",
       });
     }
 
