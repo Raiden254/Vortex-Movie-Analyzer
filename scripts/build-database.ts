@@ -1,10 +1,7 @@
 /**
- * Vortex Auto Database Builder
- * Fetches top movies + TV shows from TMDB and indexes them with Xenova CLIP
+ * Vortex Auto Database Builder — Expanded Edition
+ * Fetches top movies + TV shows from TMDB including production stills
  * Usage: npx tsx scripts/build-database.ts
- *
- * Runtime: ~2-3 hours for full run (800+ titles)
- * You can stop and restart — already-indexed titles are skipped
  */
 
 import * as fs from "fs";
@@ -38,28 +35,25 @@ const TMDB_API_KEY = process.env.TMDB_API_KEY!;
 const INDEX_NAME = "vortex-movies";
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMG = "https://image.tmdb.org/t/p/w500";
+const TMDB_STILL = "https://image.tmdb.org/t/p/w780";
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  movies: {
-    pages: 25,        // 25 pages x 20 results = 500 movies
-    enabled: true,
-  },
-  tvShows: {
-    pages: 10,        // 10 pages x 20 results = 200 TV shows
-    enabled: true,
-  },
-  anime: {
-    pages: 5,         // 5 pages x 20 results = 100 anime
-    enabled: true,
-  },
-  framesPerTitle: 2,
-  includeTrailerThumbnail: true,   // fetch YouTube trailer thumbnail as extra frame
+  movies: { pages: 25, enabled: true },
+  tvShows: { pages: 10, enabled: true },
+  anime: { pages: 5, enabled: true },
+  framesPerTitle: 5,           // poster + backdrop + up to 3 production stills
+  includeTrailerThumbnail: true,
+  includeProductionStills: true, // fetch extra scene stills from TMDB
+  stillsPerTitle: 3,           // how many production stills to grab
   delayBetweenFrames: 500,
   delayBetweenTitles: 1000,
   skipAlreadyIndexed: true,
   progressFile: "scripts/.index-progress.json",
+  // Save labeled data locally for training
+  saveTrainingData: true,
+  trainingDataDir: "training_data",
 };
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
@@ -101,7 +95,7 @@ interface IndexEntry {
   frames: FrameEntry[];
 }
 
-// ─── PROGRESS TRACKING ────────────────────────────────────────────────────────
+// ─── PROGRESS ─────────────────────────────────────────────────────────────────
 
 function loadProgress(): Set<string> {
   try {
@@ -115,6 +109,7 @@ function loadProgress(): Set<string> {
 
 function saveProgress(indexed: Set<string>) {
   try {
+    fs.mkdirSync(path.dirname(CONFIG.progressFile), { recursive: true });
     fs.writeFileSync(
       CONFIG.progressFile,
       JSON.stringify({ indexed: Array.from(indexed), updatedAt: new Date().toISOString() })
@@ -122,21 +117,20 @@ function saveProgress(indexed: Set<string>) {
   } catch { /* ignore */ }
 }
 
-// ─── TMDB GENRE MAP ───────────────────────────────────────────────────────────
+// ─── GENRE MAPS ───────────────────────────────────────────────────────────────
 
 const MOVIE_GENRES: Record<number, string> = {
   28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
   80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
   14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
-  9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
-  53: "Thriller", 10752: "War", 37: "Western",
+  9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 53: "Thriller",
+  10752: "War", 37: "Western",
 };
 
 const TV_GENRES: Record<number, string> = {
   10759: "Action & Adventure", 16: "Animation", 35: "Comedy",
   80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
-  10762: "Kids", 9648: "Mystery", 10763: "News", 10764: "Reality",
-  10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk",
+  10762: "Kids", 9648: "Mystery", 10765: "Sci-Fi & Fantasy",
   10768: "War & Politics", 37: "Western",
 };
 
@@ -149,19 +143,14 @@ function getGenres(ids: number[], isTV: boolean): string {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-function sanitizeId(str: string): string {
-  return str.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/-+/g, "-").slice(0, 60);
+function sanitizeTitle(str: string): string {
+  return str.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\s+/g, "_").slice(0, 60);
 }
 
-// Convert YouTube watch URL to thumbnail URL for embedding
 function youtubeThumbUrl(youtubeUrl: string): string | null {
-  try {
-    const match = youtubeUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-    if (!match) return null;
-    return `https://img.youtube.com/vi/${match[1]}/hqdefault.jpg`;
-  } catch {
-    return null;
-  }
+  const match = youtubeUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  if (!match) return null;
+  return `https://img.youtube.com/vi/${match[1]}/hqdefault.jpg`;
 }
 
 async function downloadImage(url: string, redirectCount = 0): Promise<Buffer | null> {
@@ -188,6 +177,19 @@ async function downloadImage(url: string, redirectCount = 0): Promise<Buffer | n
   });
 }
 
+// Save image locally for training data
+function saveTrainingImage(buffer: Buffer, title: string, frameIndex: number) {
+  if (!CONFIG.saveTrainingData) return;
+  try {
+    const dir = path.join(CONFIG.trainingDataDir, sanitizeTitle(title));
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `frame_${String(frameIndex).padStart(4, "0")}.jpg`);
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, buffer);
+    }
+  } catch { /* ignore */ }
+}
+
 // ─── TMDB FETCHERS ────────────────────────────────────────────────────────────
 
 async function fetchTMDBPage(endpoint: string, page: number): Promise<TMDBMovie[] | TMDBShow[]> {
@@ -197,12 +199,9 @@ async function fetchTMDBPage(endpoint: string, page: number): Promise<TMDBMovie[
     if (!res.ok) return [];
     const data = await res.json();
     return data.results || [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-// Fetch YouTube trailer URL from TMDB
 async function fetchTrailerUrl(id: number, type: "movie" | "tv"): Promise<string | null> {
   try {
     const url = `${TMDB_BASE}/${type}/${id}/videos?api_key=${TMDB_API_KEY}&language=en-US`;
@@ -214,9 +213,25 @@ async function fetchTrailerUrl(id: number, type: "movie" | "tv"): Promise<string
         v.type === "Trailer" && v.site === "YouTube"
     );
     return trailer ? `https://www.youtube.com/watch?v=${trailer.key}` : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
+}
+
+// Fetch production stills — real scene frames, great for training
+async function fetchProductionStills(id: number, type: "movie" | "tv"): Promise<string[]> {
+  try {
+    const url = `${TMDB_BASE}/${type}/${id}/images?api_key=${TMDB_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const backdrops = data.backdrops || [];
+    // Sort by vote_average to get the best quality stills
+    backdrops.sort((a: { vote_average: number }, b: { vote_average: number }) =>
+      b.vote_average - a.vote_average
+    );
+    return backdrops
+      .slice(0, CONFIG.stillsPerTitle)
+      .map((b: { file_path: string }) => `${TMDB_STILL}${b.file_path}`);
+  } catch { return []; }
 }
 
 async function buildMovieList(): Promise<IndexEntry[]> {
@@ -232,25 +247,28 @@ async function buildMovieList(): Promise<IndexEntry[]> {
         const year = movie.release_date?.slice(0, 4) || "Unknown";
         const frames: FrameEntry[] = [];
 
-        if (movie.poster_path) {
+        if (movie.poster_path)
           frames.push({ url: `${TMDB_IMG}${movie.poster_path}`, scene: "Movie poster" });
-        }
-        if (movie.backdrop_path && CONFIG.framesPerTitle >= 2) {
+        if (movie.backdrop_path)
           frames.push({ url: `${TMDB_IMG}${movie.backdrop_path}`, scene: "Movie backdrop" });
+
+        // Production stills
+        if (CONFIG.includeProductionStills) {
+          const stills = await fetchProductionStills(movie.id, "movie");
+          stills.forEach((url, i) => frames.push({ url, scene: `Production still ${i + 1}` }));
+          await sleep(100);
         }
 
-        // Fetch YouTube trailer and use its thumbnail as an extra frame
+        // Trailer thumbnail
         let trailerUrl: string | undefined;
         if (CONFIG.includeTrailerThumbnail) {
           const trailer = await fetchTrailerUrl(movie.id, "movie");
           if (trailer) {
             trailerUrl = trailer;
             const thumbUrl = youtubeThumbUrl(trailer);
-            if (thumbUrl) {
-              frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
-            }
+            if (thumbUrl) frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
           }
-          await sleep(150);
+          await sleep(100);
         }
 
         entries.push({
@@ -264,7 +282,7 @@ async function buildMovieList(): Promise<IndexEntry[]> {
           frames,
         });
       }
-      process.stdout.write(`\r   Page ${page}/${CONFIG.movies.pages} — ${entries.length} movies collected`);
+      process.stdout.write(`\r   Page ${page}/${CONFIG.movies.pages} — ${entries.length} movies`);
       await sleep(250);
     }
     console.log(`\n   ✅ ${entries.length} movies collected`);
@@ -282,11 +300,15 @@ async function buildMovieList(): Promise<IndexEntry[]> {
         const year = show.first_air_date?.slice(0, 4) || "Unknown";
         const frames: FrameEntry[] = [];
 
-        if (show.poster_path) {
+        if (show.poster_path)
           frames.push({ url: `${TMDB_IMG}${show.poster_path}`, scene: "Series poster" });
-        }
-        if (show.backdrop_path && CONFIG.framesPerTitle >= 2) {
+        if (show.backdrop_path)
           frames.push({ url: `${TMDB_IMG}${show.backdrop_path}`, scene: "Series backdrop" });
+
+        if (CONFIG.includeProductionStills) {
+          const stills = await fetchProductionStills(show.id, "tv");
+          stills.forEach((url, i) => frames.push({ url, scene: `Production still ${i + 1}` }));
+          await sleep(100);
         }
 
         let trailerUrl: string | undefined;
@@ -295,11 +317,9 @@ async function buildMovieList(): Promise<IndexEntry[]> {
           if (trailer) {
             trailerUrl = trailer;
             const thumbUrl = youtubeThumbUrl(trailer);
-            if (thumbUrl) {
-              frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
-            }
+            if (thumbUrl) frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
           }
-          await sleep(150);
+          await sleep(100);
         }
 
         entries.push({
@@ -313,7 +333,7 @@ async function buildMovieList(): Promise<IndexEntry[]> {
           frames,
         });
       }
-      process.stdout.write(`\r   Page ${page}/${CONFIG.tvShows.pages} — ${entries.length - movieCount} TV shows collected`);
+      process.stdout.write(`\r   Page ${page}/${CONFIG.tvShows.pages} — ${entries.length - movieCount} TV shows`);
       await sleep(250);
     }
     console.log(`\n   ✅ ${entries.length - movieCount} TV shows collected`);
@@ -334,11 +354,15 @@ async function buildMovieList(): Promise<IndexEntry[]> {
         const year = show.first_air_date?.slice(0, 4) || "Unknown";
         const frames: FrameEntry[] = [];
 
-        if (show.poster_path) {
+        if (show.poster_path)
           frames.push({ url: `${TMDB_IMG}${show.poster_path}`, scene: "Anime poster" });
-        }
-        if (show.backdrop_path && CONFIG.framesPerTitle >= 2) {
+        if (show.backdrop_path)
           frames.push({ url: `${TMDB_IMG}${show.backdrop_path}`, scene: "Anime backdrop" });
+
+        if (CONFIG.includeProductionStills) {
+          const stills = await fetchProductionStills(show.id, "tv");
+          stills.forEach((url, i) => frames.push({ url, scene: `Production still ${i + 1}` }));
+          await sleep(100);
         }
 
         let trailerUrl: string | undefined;
@@ -347,11 +371,9 @@ async function buildMovieList(): Promise<IndexEntry[]> {
           if (trailer) {
             trailerUrl = trailer;
             const thumbUrl = youtubeThumbUrl(trailer);
-            if (thumbUrl) {
-              frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
-            }
+            if (thumbUrl) frames.push({ url: thumbUrl, scene: "Trailer thumbnail", youtubeUrl: trailer });
           }
-          await sleep(150);
+          await sleep(100);
         }
 
         entries.push({
@@ -365,13 +387,13 @@ async function buildMovieList(): Promise<IndexEntry[]> {
           frames,
         });
       }
-      process.stdout.write(`\r   Page ${page}/${CONFIG.anime.pages} — ${entries.length - movieCount - tvCount} anime collected`);
+      process.stdout.write(`\r   Page ${page}/${CONFIG.anime.pages} — ${entries.length - movieCount - tvCount} anime`);
       await sleep(250);
     }
     console.log(`\n   ✅ ${entries.length - movieCount - tvCount} anime collected`);
   }
 
-  // Remove duplicates
+  // Deduplicate
   const seen = new Set<string>();
   return entries.filter(e => {
     if (seen.has(e.id)) return false;
@@ -386,8 +408,7 @@ let embedder: ReturnType<typeof pipeline> extends Promise<infer T> ? T : never;
 
 async function getEmbedder() {
   if (!embedder) {
-    console.log("\n📦 Loading Xenova CLIP model (first time only, ~400MB download)...");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    console.log("\n📦 Loading Xenova CLIP model...");
     embedder = await (pipeline as any)(
       "image-feature-extraction",
       "Xenova/clip-vit-base-patch32"
@@ -399,24 +420,24 @@ async function getEmbedder() {
 
 async function embedImage(buffer: Buffer): Promise<number[] | null> {
   try {
-    const model = await getEmbedder();
+    const model = await getEmbedder() as any;
     const image = await RawImage.fromBlob(new Blob([new Uint8Array(buffer)]));
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const output = await (model as any)(image, { pooling: "mean", normalize: true });
+    const output = await model(image, { pooling: "mean", normalize: true });
 
-    // Handle different output formats from Xenova
+    // Handle different output formats
     let values: number[] = [];
     if (output?.data) {
       values = Array.from(output.data) as number[];
     } else if (Array.isArray(output)) {
-      values = output as number[];
+      values = output.flat();
     } else if (output?.last_hidden_state?.data) {
       values = Array.from(output.last_hidden_state.data) as number[];
     }
 
-    console.log(`   Embedding dims: ${values.length}`);
-
-    if (values.length === 0) return null;
+    if (!values || values.length === 0) {
+      console.error(`   ⚠️  Empty embedding — output keys: ${Object.keys(output || {}).join(", ")}`);
+      return null;
+    }
 
     const mag = Math.sqrt(values.reduce((s, v) => s + v * v, 0));
     return mag === 0 ? values : values.map(v => v / mag);
@@ -426,34 +447,33 @@ async function embedImage(buffer: Buffer): Promise<number[] | null> {
   }
 }
 
-// ─── PINECONE UPSERT ──────────────────────────────────────────────────────────
+// ─── PINECONE ─────────────────────────────────────────────────────────────────
 
 async function upsertToPinecone(vectors: {
   id: string;
   values: number[];
   metadata: Record<string, string>;
 }[]) {
+  // Validate before sending
   const valid = vectors.filter(v =>
     Array.isArray(v.values) &&
     v.values.length > 0 &&
     v.values.every(n => typeof n === "number" && isFinite(n))
   );
 
-  if (valid.length === 0) return;
+  if (valid.length === 0) {
+    console.log(`   ⚠️  No valid embeddings to upsert`);
+    return;
+  }
 
   const { Pinecone } = await import("@pinecone-database/pinecone");
   const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
   const index = pinecone.index(INDEX_NAME);
-
-  for (const v of valid) {
-    await index.upsert({
-      records: [{
-        id: v.id,
-        values: v.values,
-        metadata: v.metadata,
-      }]
-    } as never);
-  }
+  await index.upsert(valid.map(v => ({
+    id: v.id,
+    values: v.values,
+    metadata: v.metadata,
+  })) as never);
 }
 
 async function getPineconeCount(): Promise<number> {
@@ -469,17 +489,23 @@ async function getPineconeCount(): Promise<number> {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("🚀 Vortex Auto Database Builder");
+  console.log("🚀 Vortex Auto Database Builder — Expanded Edition");
   console.log("=".repeat(60));
-  console.log("This script will index hundreds of movies and TV shows.");
-  console.log("You can stop it at any time with Ctrl+C and restart later.");
-  console.log("Progress is saved automatically.\n");
+  console.log("Includes production stills for training data collection.");
+  console.log("Stop anytime with Ctrl+C — progress is saved.\n");
 
   if (!PINECONE_API_KEY) { console.error("❌ PINECONE_API_KEY missing"); process.exit(1); }
   if (!TMDB_API_KEY) { console.error("❌ TMDB_API_KEY missing"); process.exit(1); }
 
   console.log("✓ API keys loaded");
+  console.log(`✓ Production stills: ${CONFIG.includeProductionStills ? "enabled" : "disabled"}`);
   console.log(`✓ Trailer thumbnails: ${CONFIG.includeTrailerThumbnail ? "enabled" : "disabled"}`);
+  console.log(`✓ Training data save: ${CONFIG.saveTrainingData ? `enabled → ${CONFIG.trainingDataDir}/` : "disabled"}`);
+
+  if (CONFIG.saveTrainingData) {
+    fs.mkdirSync(CONFIG.trainingDataDir, { recursive: true });
+    console.log(`✓ Training data directory ready: ${CONFIG.trainingDataDir}/`);
+  }
 
   const indexed = loadProgress();
   console.log(`📊 Previously indexed: ${indexed.size} frames`);
@@ -489,14 +515,17 @@ async function main() {
 
   console.log("\n⬇️  Building title list from TMDB...");
   const allTitles = await buildMovieList();
-  console.log(`\n📋 Total titles to process: ${allTitles.length}`);
+
+  const totalFrames = allTitles.reduce((s, t) => s + t.frames.length, 0);
+  console.log(`\n📋 Total titles: ${allTitles.length}`);
+  console.log(`🖼️  Total frames: ${totalFrames}`);
   console.log(`🎬 Titles with trailers: ${allTitles.filter(t => t.trailerUrl).length}`);
 
   const toProcess = CONFIG.skipAlreadyIndexed
     ? allTitles.filter(t => !Array.from(indexed).some(id => id.startsWith(t.id)))
     : allTitles;
 
-  console.log(`📋 Titles to index (skipping done): ${toProcess.length}`);
+  console.log(`📋 Titles to index: ${toProcess.length}`);
   console.log("\nStarting indexing...\n");
 
   await getEmbedder();
@@ -504,6 +533,7 @@ async function main() {
   let totalIndexed = 0;
   let totalFailed = 0;
   let totalSkipped = 0;
+  let trainingImagesSaved = 0;
 
   for (let ti = 0; ti < toProcess.length; ti++) {
     const title = toProcess[ti];
@@ -528,18 +558,22 @@ async function main() {
         continue;
       }
 
-const embedding = await embedImage(buffer);
-if (!embedding || embedding.length === 0) {
-  totalFailed++;
-  continue;
-}
+      // Save for training data
+      if (CONFIG.saveTrainingData) {
+        saveTrainingImage(buffer, title.title, fi);
+        trainingImagesSaved++;
+      }
 
-const safeEmbedding: number[] = embedding;
+      const embedding = await embedImage(buffer);
+      if (!embedding) {
+        totalFailed++;
+        continue;
+      }
 
       try {
         await upsertToPinecone([{
           id: vectorId,
-          values: safeEmbedding,
+          values: embedding,
           metadata: {
             title: title.title,
             year: title.year,
@@ -566,8 +600,11 @@ const safeEmbedding: number[] = embedding;
     saveProgress(indexed);
 
     if (titleIndexed > 0) {
-      const trailerNote = title.trailerUrl ? " 🎬" : "";
-      process.stdout.write(` ✅ (${titleIndexed} frame${titleIndexed > 1 ? "s" : ""}${trailerNote})\n`);
+      const notes = [
+        title.trailerUrl ? "🎬" : "",
+        titleIndexed > 2 ? `${titleIndexed}f` : "",
+      ].filter(Boolean).join(" ");
+      process.stdout.write(` ✅ ${notes}\n`);
     } else {
       process.stdout.write(` ⚠️  skipped\n`);
     }
@@ -576,7 +613,7 @@ const safeEmbedding: number[] = embedding;
 
     if ((ti + 1) % 50 === 0) {
       const afterCount = await getPineconeCount();
-      console.log(`\n📊 Progress: ${ti + 1}/${toProcess.length} titles | ${totalIndexed} indexed | ${totalFailed} failed | Pinecone: ${afterCount} vectors\n`);
+      console.log(`\n📊 Progress: ${ti + 1}/${toProcess.length} | indexed: ${totalIndexed} | failed: ${totalFailed} | Pinecone: ${afterCount} | training images: ${trainingImagesSaved}\n`);
     }
   }
 
@@ -587,9 +624,14 @@ const safeEmbedding: number[] = embedding;
   console.log(`   Frames indexed: ${totalIndexed}`);
   console.log(`   Frames failed: ${totalFailed}`);
   console.log(`   Frames skipped: ${totalSkipped}`);
+  console.log(`   Training images saved: ${trainingImagesSaved}`);
   console.log(`   Pinecone before: ${beforeCount}`);
   console.log(`   Pinecone after:  ${afterCount}`);
   console.log(`   New vectors: ${afterCount - beforeCount}`);
+  if (CONFIG.saveTrainingData) {
+    console.log(`\n📁 Training data saved to: ${CONFIG.trainingDataDir}/`);
+    console.log(`   ${trainingImagesSaved} labeled images ready for Month 2 fine-tuning`);
+  }
   console.log("\n🎯 Your database is ready!");
 }
 

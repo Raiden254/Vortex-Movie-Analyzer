@@ -20,10 +20,7 @@ const FALLBACK = {
 
 const INDEX_NAME = "vortex-movies";
 
-// ─── PINECONE TITLE VERIFICATION ─────────────────────────────────────────────
-// Instead of vector search (requires Xenova which can't run on Vercel),
-// we verify Gemini's answer by checking if the title exists in our database.
-// If it does, we boost confidence. This uses metadata filtering — instant and free.
+// ─── PINECONE VERIFICATION ────────────────────────────────────────────────────
 
 interface PineconeVerification {
   verified: boolean;
@@ -45,29 +42,20 @@ async function verifyWithPinecone(
     const pinecone = new Pinecone({ apiKey: pineconeKey });
     const index = pinecone.index(INDEX_NAME);
 
-    // Fetch index stats to check if database has any vectors
     const stats = await index.describeIndexStats();
     const totalVectors = stats.totalRecordCount || 0;
+    if (totalVectors === 0) return { verified: false, confidence: 0 };
 
-    if (totalVectors === 0) {
-      return { verified: false, confidence: 0 };
-    }
-
-    // Use a dummy vector to do a metadata-filtered search
-    // We search for the title in metadata across all indexed movies
     const dummyVector = new Array(512).fill(0);
-    dummyVector[0] = 1; // non-zero so Pinecone accepts it
+    dummyVector[0] = 1;
 
     const queryResponse = await index.query({
       vector: dummyVector,
       topK: 100,
       includeMetadata: true,
-      filter: undefined, // fetch all, we'll filter manually
     });
 
     const matches = queryResponse.matches || [];
-
-    // Search for title match in metadata
     const cleanTitle = title.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
 
     const titleMatch = matches.find((m) => {
@@ -82,17 +70,14 @@ async function verifyWithPinecone(
       );
     });
 
-    if (!titleMatch) {
-      return { verified: false, confidence: 0 };
-    }
+    if (!titleMatch) return { verified: false, confidence: 0 };
 
-    // Check if year also matches for stronger verification
     const dbYear = (titleMatch.metadata?.year as string) || "";
     const yearMatches = dbYear === year || !year || year === "—";
 
     return {
       verified: true,
-      confidence: yearMatches ? 15 : 8, // boost amount
+      confidence: yearMatches ? 15 : 8,
       databaseTitle: titleMatch.metadata?.title as string,
       databaseYear: dbYear,
       databaseGenre: titleMatch.metadata?.genre as string,
@@ -130,10 +115,10 @@ async function fetchTMDB(title: string, year: string, knownMediaType?: string) {
     if (knownMediaType === "tv") {
       isTV = true;
       best = shows.find((s: { first_air_date?: string }) =>
-        s.first_air_date?.slice(0, 4) === year)
-       |shows.sort((a: { popularity: number }, b: { popularity: number }) => 
+        s.first_air_date?.slice(0, 4) === year
+      ) || shows.sort((a: { popularity: number }, b: { popularity: number }) =>
         b.popularity - a.popularity
-    )[0] || null;
+      )[0] || null;
     } else if (knownMediaType === "movie") {
       isTV = false;
       best = movies.find((m: { release_date?: string }) =>
@@ -298,7 +283,6 @@ async function runGemini(base64: string, mimeType: string) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
 
-  // MASSIVELY improved prompt for accuracy
   const prompt = `You are an elite movie and TV show scene identification system with encyclopedic knowledge of cinema and television worldwide, including Hollywood, Bollywood, African cinema, anime, K-dramas, European films, and all streaming content.
 
 TASK: Identify the exact movie or TV show this image is from.
@@ -362,75 +346,74 @@ RULES:
 - If UNKNOWN, still provide best guesses in alternatives
 - Title must be the ORIGINAL title (not a localized translation)`;
 
+  const requestBody = {
+    contents: [
+      {
+        parts: [
+          { inline_data: { mime_type: mimeType, data: base64 } },
+          { text: prompt },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.05,
+      maxOutputTokens: 2048,
+      responseMimeType: "application/json",
+    },
+  };
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { inline_data: { mime_type: mimeType, data: base64 } },
-              { text: prompt },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.05, // lower = more precise, less creative guessing
-          maxOutputTokens: 2048,
-          responseMimeType: "application/json",
-        },
-      }),
+      body: JSON.stringify(requestBody),
     }
   );
 
-// Retry once on 503
-if (response.status === 503) {
-  console.log("Gemini 503 — retrying in 5s...");
-  await new Promise(r => setTimeout(r, 5000));
-  const retry = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: prompt }] }],
-        generationConfig: { temperature: 0.05, maxOutputTokens: 2048, responseMimeType: "application/json" },
-      }),
+  // Handle 503 with one retry
+  if (response.status === 503) {
+    console.log("Gemini 503 — retrying in 5s...");
+    await new Promise(r => setTimeout(r, 5000));
+    const retry = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }
+    );
+    if (!retry.ok) return { _serviceUnavailable: true };
+    const retryData = await retry.json();
+    const retryText = retryData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    if (!retryText) return null;
+    try { return JSON.parse(retryText.trim()); } catch {
+      const m = retryText.match(/\{[\s\S]*\}/);
+      if (m) try { return JSON.parse(m[0]); } catch { /* ignore */ }
     }
-  );
-  if (!retry.ok) {
-    return { _serviceUnavailable: true };
+    return null;
   }
-  const retryData = await retry.json();
-  const retryText = retryData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  if (!retryText) return null;
-  for (const attempt of [
-    () => JSON.parse(retryText.trim()),
-    () => { const m = retryText.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error(); },
-  ]) {
-    try { return attempt(); } catch { continue; }
-  }
-  return null;
-}
 
-if (response.status === 429) return { _quotaExceeded: true };
-if (!response.ok) {
-  console.error("Gemini error:", response.status);
-  return null;
-}
+  if (response.status === 429) return { _quotaExceeded: true };
+
+  if (!response.ok) {
+    console.error("Gemini error:", response.status);
+    return null;
+  }
 
   const geminiData = await response.json();
   const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   console.log("RAW GEMINI TEXT:", rawText);
   if (!rawText) return null;
 
-  for (const attempt of [
+  // Try multiple parsing strategies
+  const strategies = [
     () => JSON.parse(rawText.trim()),
     () => { const m = rawText.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error(); },
     () => { const c = rawText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim(); const m = c.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error(); },
-  ]) {
+  ];
+
+  for (const attempt of strategies) {
     try { return attempt(); } catch { continue; }
   }
 
@@ -460,10 +443,9 @@ export async function POST(req: NextRequest) {
     const base64 = Buffer.from(bytes).toString("base64");
     const mimeType = file.type || "image/jpeg";
 
-    // ── Step 1: Run Gemini identification ────────────────────────────────────
+    // Step 1: Run Gemini
     const geminiResult = await runGemini(base64, mimeType);
 
-    // Handle quota exceeded
     if (geminiResult?._quotaExceeded) {
       return NextResponse.json({
         ...FALLBACK,
@@ -471,7 +453,7 @@ export async function POST(req: NextRequest) {
         description: "Vortex is getting a lot of love right now! Daily AI limit reached. Please try again in a few hours.",
       });
     }
-    // Add this right after 
+
     if (geminiResult?._serviceUnavailable) {
       return NextResponse.json({
         ...FALLBACK,
@@ -486,7 +468,7 @@ export async function POST(req: NextRequest) {
     const geminiYear = geminiResult.year || "—";
     const geminiConfidence = geminiResult.confidence ?? 0;
 
-    // ── Step 2: Pinecone title verification + TMDB + Subtitles in parallel ───
+    // Step 2: Pinecone + TMDB + Subtitles in parallel
     const [pineconeVerification, tmdbData, subtitleResult] = await Promise.all([
       geminiTitle !== "UNKNOWN"
         ? verifyWithPinecone(geminiTitle, geminiYear)
@@ -504,18 +486,16 @@ export async function POST(req: NextRequest) {
         : Promise.resolve(null),
     ]);
 
-    // ── Step 3: Combine all confidence signals ────────────────────────────────
+    // Step 3: Combine confidence signals
     let finalConfidence = geminiConfidence;
     let finalTitle = geminiTitle;
     let finalTmdb = tmdbData;
 
-    // Pinecone verification boost
     if (pineconeVerification.verified) {
       finalConfidence = Math.min(100, finalConfidence + pineconeVerification.confidence);
       console.log(`Pinecone verified "${geminiTitle}" — boosted by ${pineconeVerification.confidence}%`);
     }
 
-    // Subtitle matching boost/override
     const { finalConfidence: subtitleConfidence, boosted, overridden, overrideTitle } =
       combineConfidence(finalConfidence, subtitleResult, finalTitle);
 
@@ -530,7 +510,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── Step 4: Build final result ────────────────────────────────────────────
+    // Step 4: Return final result
     return NextResponse.json({
       title: finalTitle || "UNKNOWN",
       year: geminiYear,
@@ -541,9 +521,7 @@ export async function POST(req: NextRequest) {
       description: geminiResult.description || "No description available.",
       scene: geminiResult.scene || "—",
       confidence: finalConfidence,
-      alternatives: Array.isArray(geminiResult.alternatives)
-        ? geminiResult.alternatives
-        : [],
+      alternatives: Array.isArray(geminiResult.alternatives) ? geminiResult.alternatives : [],
       signals: {
         visual: geminiResult.signals?.visual ?? 0,
         dialogue: geminiResult.signals?.dialogue ?? 0,

@@ -40,6 +40,8 @@ type HistoryEntry = {
   timestamp: number;
 };
 
+type FeedbackState = "idle" | "submitting" | "correct" | "incorrect" | "corrected";
+
 export default function IdentifyPage() {
   const [tab, setTab] = useState<"image" | "video">("image");
   const [file, setFile] = useState<File | null>(null);
@@ -53,6 +55,9 @@ export default function IdentifyPage() {
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
   const [currentPreview, setCurrentPreview] = useState<string | null>(null);
+  const [feedbackState, setFeedbackState] = useState<FeedbackState>("idle");
+  const [correctTitle, setCorrectTitle] = useState("");
+  const [correctYear, setCorrectYear] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const shareCardRef = useRef<HTMLDivElement>(null);
 
@@ -65,7 +70,6 @@ export default function IdentifyPage() {
   ];
   const [stageIdx, setStageIdx] = useState(0);
 
-  // Load history from sessionStorage on mount
   useEffect(() => {
     try {
       const saved = sessionStorage.getItem("vortex-history");
@@ -81,7 +85,7 @@ export default function IdentifyPage() {
       timestamp: Date.now(),
     };
     setHistory(prev => {
-      const updated = [entry, ...prev].slice(0, 20); // keep last 20
+      const updated = [entry, ...prev].slice(0, 20);
       try { sessionStorage.setItem("vortex-history", JSON.stringify(updated)); } catch { /* ignore */ }
       return updated;
     });
@@ -113,6 +117,7 @@ export default function IdentifyPage() {
     setResult(null);
     setStatus("idle");
     setErrorMsg("");
+    setFeedbackState("idle");
     if (f.type.startsWith("image/") && f.size > 2 * 1024 * 1024) {
       const compressed = await compressImage(f);
       setFile(compressed);
@@ -140,6 +145,7 @@ export default function IdentifyPage() {
     setResult(null);
     setErrorMsg("");
     setStageIdx(0);
+    setFeedbackState("idle");
 
     let si = 0;
     const iv = setInterval(() => {
@@ -178,6 +184,9 @@ export default function IdentifyPage() {
     setResult(null);
     setStatus("idle");
     setErrorMsg("");
+    setFeedbackState("idle");
+    setCorrectTitle("");
+    setCorrectYear("");
     if (fileRef.current) fileRef.current.value = "";
   }
 
@@ -185,6 +194,7 @@ export default function IdentifyPage() {
     setResult(entry.result);
     setPreview(entry.preview);
     setStatus("done");
+    setFeedbackState("idle");
     setShowHistory(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -192,6 +202,31 @@ export default function IdentifyPage() {
   function clearHistory() {
     setHistory([]);
     try { sessionStorage.removeItem("vortex-history"); } catch { /* ignore */ }
+  }
+
+  async function submitFeedback(wasCorrect: boolean, corrTitle?: string, corrYear?: string) {
+    if (!result) return;
+    setFeedbackState("submitting");
+
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          geminiTitle: result.title,
+          geminiYear: result.year,
+          correctTitle: corrTitle || result.title,
+          correctYear: corrYear || result.year,
+          wasCorrect,
+          confidence: result.confidence,
+          signals: result.signals,
+        }),
+      });
+
+      setFeedbackState(wasCorrect ? "correct" : "corrected");
+    } catch {
+      setFeedbackState("idle");
+    }
   }
 
   async function copyShareText() {
@@ -347,49 +382,32 @@ export default function IdentifyPage() {
           </div>
         )}
 
-{/* ERROR / QUOTA */}
-{status === "error" && (
-  <div style={{
-    background: "var(--surface)",
-    border: `1px solid ${errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? "rgba(239,159,39,0.3)" : "rgba(224,92,92,0.3)"}`,
-    borderRadius: "16px",
-    padding: "40px 32px",
-    textAlign: "center"
-  }}>
-    {errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? (
-      <>
-        <div style={{ fontSize: "48px", marginBottom: "16px" }}>🔥</div>
-        <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", color: "#EF9F27", marginBottom: "8px" }}>Daily limit reached</div>
-        <div style={{ fontSize: "20px", fontWeight: 800, color: "var(--text)", marginBottom: "10px", letterSpacing: "-0.3px" }}>Vortex is in high demand!</div>
-        <div style={{ fontSize: "13px", color: "var(--muted)", lineHeight: 1.7, marginBottom: "24px", maxWidth: "340px", margin: "0 auto 24px" }}>
-          Our free AI quota has been used up for today. This resets every 24 hours at midnight Pacific time. Come back soon!
-        </div>
-        <div style={{ background: "rgba(239,159,39,0.08)", border: "1px solid rgba(239,159,39,0.2)", borderRadius: "10px", padding: "14px 20px", display: "inline-block", marginBottom: "24px" }}>
-          <div style={{ fontFamily: "DM Mono, monospace", fontSize: "11px", color: "#EF9F27", letterSpacing: "1px" }}>
-            ⏰ Resets in ~{new Date().getHours() < 8 ? `${8 - new Date().getHours()}h` : `${32 - new Date().getHours()}h`}
+        {/* ERROR */}
+        {status === "error" && (
+          <div style={{ background: "var(--surface)", border: `1px solid ${errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? "rgba(239,159,39,0.3)" : "rgba(224,92,92,0.3)"}`, borderRadius: "16px", padding: "40px 32px", textAlign: "center", animation: "fadeup 0.3s ease forwards" }}>
+            {errorMsg.toLowerCase().includes("quota") || errorMsg.toLowerCase().includes("limit") ? (
+              <>
+                <div style={{ fontSize: "48px", marginBottom: "16px" }}>🔥</div>
+                <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", color: "#EF9F27", marginBottom: "8px" }}>Daily limit reached</div>
+                <div style={{ fontSize: "20px", fontWeight: 800, color: "var(--text)", marginBottom: "10px" }}>Vortex is in high demand!</div>
+                <div style={{ fontSize: "13px", color: "var(--muted)", lineHeight: 1.7, marginBottom: "24px", maxWidth: "340px", margin: "0 auto 24px" }}>
+                  Our free AI quota has been used up for today. Resets at midnight Pacific time.
+                </div>
+                <div style={{ display: "flex", gap: "10px", justifyContent: "center" }}>
+                  <button onClick={reset} style={{ padding: "10px 20px", borderRadius: "8px", border: "none", background: "#EF9F27", color: "#1a0f00", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>Try again</button>
+                  <a href="/" style={{ padding: "10px 20px", borderRadius: "8px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", fontFamily: "Syne, sans-serif", textDecoration: "none", display: "inline-flex", alignItems: "center" }}>← Back to home</a>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: "32px", marginBottom: "12px" }}>⚠️</div>
+                <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--text)", marginBottom: "8px" }}>Identification failed</div>
+                <div style={{ fontSize: "13px", color: "var(--muted)", marginBottom: "24px" }}>{errorMsg}</div>
+                <button onClick={reset} style={{ padding: "9px 20px", borderRadius: "8px", border: "none", background: "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>Try again</button>
+              </>
+            )}
           </div>
-        </div>
-        <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
-          <button onClick={reset} style={{ padding: "10px 20px", borderRadius: "8px", border: "none", background: "#EF9F27", color: "#1a0f00", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
-            Try again
-          </button>
-          <a href="/" style={{ padding: "10px 20px", borderRadius: "8px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", fontFamily: "Syne, sans-serif", textDecoration: "none", display: "inline-flex", alignItems: "center" }}>
-            ← Back to home
-          </a>
-        </div>
-      </>
-    ) : (
-      <>
-        <div style={{ fontSize: "32px", marginBottom: "12px" }}>⚠️</div>
-        <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--text)", marginBottom: "8px" }}>Identification failed</div>
-        <div style={{ fontSize: "13px", color: "var(--muted)", marginBottom: "24px" }}>{errorMsg}</div>
-        <button onClick={reset} style={{ padding: "9px 20px", borderRadius: "8px", border: "none", background: "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
-          Try again
-        </button>
-      </>
-    )}
-  </div>
-)}
+        )}
 
         {/* RESULT */}
         {status === "done" && result && (
@@ -408,41 +426,32 @@ export default function IdentifyPage() {
             <div ref={shareCardRef} style={{ background: "var(--surface)", border: "1px solid var(--border2)", borderRadius: "16px", overflow: "hidden" }}>
               <div style={{ height: "3px", background: `linear-gradient(to right, var(--blue), ${confidenceColor(result.confidence)})` }}></div>
               <div style={{ padding: "28px", display: "flex", gap: "20px", flexWrap: "wrap" }}>
-
-                {/* POSTER */}
                 {result.tmdb?.poster && (
                   <div style={{ flexShrink: 0 }}>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src={result.tmdb.poster} alt="Poster" style={{ width: "110px", borderRadius: "10px", display: "block", boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }} />
                   </div>
                 )}
-
                 <div style={{ flex: 1, minWidth: "200px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
                     <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", fontWeight: 600, letterSpacing: "1px", textTransform: "uppercase", padding: "3px 10px", borderRadius: "4px", background: `${confidenceColor(result.confidence)}18`, color: confidenceColor(result.confidence), border: `1px solid ${confidenceColor(result.confidence)}40` }}>
                       {result.confidence}% match
                     </div>
                     {result.tmdb?.voteAverage && (
-                      <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", color: "var(--muted)" }}>
-                        ⭐ {result.tmdb.voteAverage} TMDB
-                      </div>
+                      <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", color: "var(--muted)" }}>⭐ {result.tmdb.voteAverage} TMDB</div>
                     )}
                   </div>
-
                   <div style={{ fontSize: "clamp(22px,4vw,34px)", fontWeight: 800, letterSpacing: "-0.5px", color: "var(--text)", lineHeight: 1.05, marginBottom: "4px" }}>
                     {result.title}
                   </div>
-
                   {result.tmdb?.tagline && (
                     <div style={{ fontSize: "13px", color: "var(--blue-bright)", fontStyle: "italic", marginBottom: "8px" }}>
                       &ldquo;{result.tmdb.tagline}&rdquo;
                     </div>
                   )}
-
                   <div style={{ fontFamily: "DM Mono, monospace", fontSize: "12px", color: "var(--muted)", marginBottom: "12px", lineHeight: 1.7 }}>
                     <span style={{ color: "var(--text)" }}>{result.year}</span> · {result.director} · {result.runtime}
                   </div>
-
                   {result.tmdb?.genres && result.tmdb.genres.length > 0 && (
                     <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "12px" }}>
                       {result.tmdb.genres.map(g => (
@@ -450,16 +459,12 @@ export default function IdentifyPage() {
                       ))}
                     </div>
                   )}
-
                   <div style={{ fontSize: "13px", color: "var(--muted)", lineHeight: 1.65, paddingTop: "12px", borderTop: "1px solid var(--border2)", marginBottom: "10px" }}>
                     {result.description}
                   </div>
-
                   <div style={{ fontFamily: "DM Mono, monospace", fontSize: "11px", color: "#EF9F27", fontStyle: "italic", marginBottom: "16px" }}>
                     {result.scene}
                   </div>
-
-                  {/* ACTION BUTTONS */}
                   <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
                     {result.tmdb?.trailer && (
                       <a href={result.tmdb.trailer} target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 16px", borderRadius: "8px", background: "#FF0000", color: "#fff", fontSize: "12px", fontWeight: 600, textDecoration: "none", fontFamily: "Syne, sans-serif" }}>
@@ -471,16 +476,105 @@ export default function IdentifyPage() {
                         View on TMDB
                       </a>
                     )}
-                    {/* SHARE BUTTON */}
-                    <button
-                      onClick={() => setShowShareModal(true)}
-                      style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 16px", borderRadius: "8px", background: "var(--surface2)", border: "1px solid var(--border2)", color: "var(--muted)", fontSize: "12px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}
-                    >
+                    <button onClick={() => setShowShareModal(true)} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 16px", borderRadius: "8px", background: "var(--surface2)", border: "1px solid var(--border2)", color: "var(--muted)", fontSize: "12px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
                       ↗ Share result
                     </button>
                   </div>
                 </div>
               </div>
+            </div>
+
+            {/* ── FEEDBACK CARD ─────────────────────────────────────────────── */}
+            <div style={{ background: "var(--surface)", border: "1px solid var(--border2)", borderRadius: "16px", padding: "20px 24px" }}>
+              {feedbackState === "idle" && (
+                <>
+                  <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", color: "var(--blue-bright)", marginBottom: "10px" }}>
+                    Was this correct?
+                  </div>
+                  <div style={{ fontSize: "13px", color: "var(--muted)", marginBottom: "14px" }}>
+                    Help Vortex learn — your feedback trains our AI to get better.
+                  </div>
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    <button
+                      onClick={() => submitFeedback(true)}
+                      style={{ flex: 1, padding: "10px", borderRadius: "9px", border: "1px solid rgba(61,184,122,0.3)", background: "rgba(61,184,122,0.08)", color: "#3DB87A", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+                    >
+                      ✓ Yes, correct!
+                    </button>
+                    <button
+                      onClick={() => setFeedbackState("incorrect")}
+                      style={{ flex: 1, padding: "10px", borderRadius: "9px", border: "1px solid rgba(224,92,92,0.3)", background: "rgba(224,92,92,0.08)", color: "#E05C5C", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+                    >
+                      ✗ Wrong movie
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {feedbackState === "incorrect" && (
+                <>
+                  <div style={{ fontFamily: "DM Mono, monospace", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", color: "#E05C5C", marginBottom: "10px" }}>
+                    What is the correct movie?
+                  </div>
+                  <div style={{ display: "flex", gap: "10px", marginBottom: "12px", flexWrap: "wrap" }}>
+                    <input
+                      type="text"
+                      placeholder="Movie / show title"
+                      value={correctTitle}
+                      onChange={e => setCorrectTitle(e.target.value)}
+                      style={{ flex: 2, padding: "9px 14px", borderRadius: "8px", border: "1px solid var(--border2)", background: "var(--surface2)", color: "var(--text)", fontSize: "13px", fontFamily: "Syne, sans-serif", outline: "none", minWidth: "160px" }}
+                    />
+                    <input
+                      type="text"
+                      placeholder="Year"
+                      value={correctYear}
+                      onChange={e => setCorrectYear(e.target.value)}
+                      style={{ flex: 1, padding: "9px 14px", borderRadius: "8px", border: "1px solid var(--border2)", background: "var(--surface2)", color: "var(--text)", fontSize: "13px", fontFamily: "Syne, sans-serif", outline: "none", minWidth: "80px" }}
+                    />
+                  </div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      onClick={() => submitFeedback(false, correctTitle, correctYear)}
+                      disabled={!correctTitle.trim()}
+                      style={{ flex: 1, padding: "10px", borderRadius: "9px", border: "none", background: correctTitle.trim() ? "var(--blue)" : "var(--surface2)", color: correctTitle.trim() ? "#fff" : "var(--muted)", fontSize: "13px", fontWeight: 600, cursor: correctTitle.trim() ? "pointer" : "not-allowed", fontFamily: "Syne, sans-serif" }}
+                    >
+                      Submit correction
+                    </button>
+                    <button
+                      onClick={() => setFeedbackState("idle")}
+                      style={{ padding: "10px 16px", borderRadius: "9px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {feedbackState === "submitting" && (
+                <div style={{ textAlign: "center", padding: "8px 0", color: "var(--muted)", fontSize: "13px" }}>
+                  Saving feedback...
+                </div>
+              )}
+
+              {feedbackState === "correct" && (
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "rgba(61,184,122,0.15)", border: "1px solid rgba(61,184,122,0.3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px", flexShrink: 0 }}>✓</div>
+                  <div>
+                    <div style={{ fontSize: "13px", fontWeight: 600, color: "#3DB87A" }}>Thank you!</div>
+                    <div style={{ fontSize: "12px", color: "var(--muted)" }}>Your feedback helps train Vortex to be more accurate.</div>
+                  </div>
+                </div>
+              )}
+
+              {feedbackState === "corrected" && (
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div style={{ width: "32px", height: "32px", borderRadius: "50%", background: "rgba(45,126,248,0.15)", border: "1px solid rgba(45,126,248,0.3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px", flexShrink: 0 }}>🎓</div>
+                  <div>
+                    <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--blue-bright)" }}>Correction saved!</div>
+                    <div style={{ fontSize: "12px", color: "var(--muted)" }}>Vortex will use this to improve future identifications.</div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* STREAMING */}
@@ -568,9 +662,9 @@ export default function IdentifyPage() {
         )}
       </div>
 
-      {/* ── HISTORY MODAL ──────────────────────────────────────────────────── */}
+      {/* HISTORY MODAL */}
       {showHistory && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", zIndex: 100, display: "flex", alignItems: "flex-end", justifyContent: "center", padding: "0 0 0 0" }} onClick={() => setShowHistory(false)}>
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", zIndex: 100, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={() => setShowHistory(false)}>
           <div onClick={e => e.stopPropagation()} style={{ background: "var(--surface)", border: "1px solid var(--border2)", borderRadius: "20px 20px 0 0", width: "100%", maxWidth: "820px", maxHeight: "75vh", overflow: "hidden", display: "flex", flexDirection: "column", animation: "slideup 0.3s ease forwards" }}>
             <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border2)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <div>
@@ -578,23 +672,13 @@ export default function IdentifyPage() {
                 <div style={{ fontSize: "12px", color: "var(--muted)" }}>{history.length} identification{history.length !== 1 ? "s" : ""} this session</div>
               </div>
               <div style={{ display: "flex", gap: "8px" }}>
-                <button onClick={clearHistory} style={{ padding: "6px 12px", borderRadius: "7px", border: "1px solid rgba(224,92,92,0.3)", background: "transparent", color: "#E05C5C", fontSize: "12px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
-                  Clear all
-                </button>
-                <button onClick={() => setShowHistory(false)} style={{ padding: "6px 12px", borderRadius: "7px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "12px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
-                  Close
-                </button>
+                <button onClick={clearHistory} style={{ padding: "6px 12px", borderRadius: "7px", border: "1px solid rgba(224,92,92,0.3)", background: "transparent", color: "#E05C5C", fontSize: "12px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}>Clear all</button>
+                <button onClick={() => setShowHistory(false)} style={{ padding: "6px 12px", borderRadius: "7px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "12px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}>Close</button>
               </div>
             </div>
             <div style={{ overflowY: "auto", padding: "16px 24px", display: "flex", flexDirection: "column", gap: "10px" }}>
               {history.map(entry => (
-                <div
-                  key={entry.id}
-                  onClick={() => loadFromHistory(entry)}
-                  style={{ display: "flex", gap: "14px", alignItems: "center", padding: "14px", background: "var(--surface2)", border: "1px solid var(--border2)", borderRadius: "12px", cursor: "pointer", transition: "border-color .15s" }}
-                  onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--blue)")}
-                  onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border2)")}
-                >
+                <div key={entry.id} onClick={() => loadFromHistory(entry)} style={{ display: "flex", gap: "14px", alignItems: "center", padding: "14px", background: "var(--surface2)", border: "1px solid var(--border2)", borderRadius: "12px", cursor: "pointer", transition: "border-color .15s" }} onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--blue)")} onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border2)")}>
                   {entry.preview ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={entry.preview} alt="" style={{ width: "60px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0 }} />
@@ -617,12 +701,10 @@ export default function IdentifyPage() {
         </div>
       )}
 
-      {/* ── SHARE MODAL ────────────────────────────────────────────────────── */}
+      {/* SHARE MODAL */}
       {showShareModal && result && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }} onClick={() => setShowShareModal(false)}>
           <div onClick={e => e.stopPropagation()} style={{ background: "var(--surface)", border: "1px solid var(--border2)", borderRadius: "20px", width: "100%", maxWidth: "480px", overflow: "hidden", animation: "fadeup 0.3s ease forwards" }}>
-
-            {/* Share card preview */}
             <div style={{ background: "linear-gradient(135deg, #0A0E1A 0%, #111620 100%)", padding: "28px", position: "relative", overflow: "hidden" }}>
               <div style={{ position: "absolute", top: "-40px", right: "-40px", width: "160px", height: "160px", borderRadius: "50%", background: "rgba(45,126,248,0.08)", border: "1px solid rgba(45,126,248,0.12)" }}></div>
               <div style={{ display: "flex", gap: "16px", alignItems: "flex-start", position: "relative" }}>
@@ -645,27 +727,17 @@ export default function IdentifyPage() {
                 <div style={{ fontFamily: "DM Mono, monospace", fontSize: "9px", color: "rgba(255,255,255,0.25)" }}>Powered by Ace Analytics</div>
               </div>
             </div>
-
-            {/* Share actions */}
             <div style={{ padding: "20px 24px" }}>
               <div style={{ fontSize: "14px", fontWeight: 600, color: "var(--text)", marginBottom: "4px" }}>Share this result</div>
               <div style={{ fontSize: "12px", color: "var(--muted)", marginBottom: "16px" }}>Copy the share text and post it anywhere</div>
-
               <div style={{ background: "var(--surface2)", border: "1px solid var(--border2)", borderRadius: "10px", padding: "12px 14px", marginBottom: "12px", fontFamily: "DM Mono, monospace", fontSize: "11px", color: "var(--muted)", lineHeight: 1.6 }}>
                 🎬 I just identified &quot;{result.title}&quot; ({result.year}) using Vortex Movie Analyzer — {result.confidence}% confidence!{"\n\n"}Powered by Ace Analytics · vortex-movie-analyzer.vercel.app
               </div>
-
               <div style={{ display: "flex", gap: "8px" }}>
-                <button
-                  onClick={copyShareText}
-                  style={{ flex: 1, padding: "10px", borderRadius: "9px", border: "none", background: shareCopied ? "#3DB87A" : "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif", transition: "background .3s", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
-                >
+                <button onClick={copyShareText} style={{ flex: 1, padding: "10px", borderRadius: "9px", border: "none", background: shareCopied ? "#3DB87A" : "var(--blue)", color: "#fff", fontSize: "13px", fontWeight: 600, cursor: "pointer", fontFamily: "Syne, sans-serif", transition: "background .3s", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}>
                   {shareCopied ? "✓ Copied!" : "Copy share text"}
                 </button>
-                <button
-                  onClick={() => setShowShareModal(false)}
-                  style={{ padding: "10px 16px", borderRadius: "9px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}
-                >
+                <button onClick={() => setShowShareModal(false)} style={{ padding: "10px 16px", borderRadius: "9px", border: "1px solid var(--border2)", background: "transparent", color: "var(--muted)", fontSize: "13px", cursor: "pointer", fontFamily: "Syne, sans-serif" }}>
                   Close
                 </button>
               </div>
@@ -700,6 +772,8 @@ export default function IdentifyPage() {
           from { transform: translateY(100%); }
           to { transform: translateY(0); }
         }
+        input::placeholder { color: var(--muted); }
+        input:focus { border-color: var(--blue) !important; }
       `}</style>
     </div>
   );
